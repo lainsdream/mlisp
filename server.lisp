@@ -127,11 +127,14 @@
     (format t "Server started on http://localhost:~a/~%" port)
     (loop
       (let ((client (sb-bsd-sockets:socket-accept socket)))
-        (unwind-protect
-             (let ((stream (sb-bsd-sockets:socket-make-stream client :input t :output t)))
-               (handle-request stream)
-               (close stream))
-          (sb-bsd-sockets:socket-close client))))))
+        (sb-thread:make-thread
+         (lambda ()
+           (unwind-protect
+                (let ((stream (sb-bsd-sockets:socket-make-stream client :input t :output t)))
+                  (handle-request stream)
+                  (close stream))
+             (sb-bsd-sockets:socket-close client)))
+         :name "http-client")))))
 
 (start-simple-server 4242)
 
