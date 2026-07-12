@@ -353,18 +353,19 @@
   ;;; ---------------------------------------------------------------------
   ;;; Process helpers
   ;;; ---------------------------------------------------------------------
-
 (defun run-and-capture (argv &key input timeout)
   "Run ARGV, return (values exit-code stdout stderr).
-Kills after TIMEOUT seconds and always closes process streams."
-  (let* ((proc (sb-ext:run-program (first argv) (rest argv)
+Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output."
+  (let* ((out-file (format nil "/tmp/rac-out-~a.txt" (random 1000000)))
+         (err-file (format nil "/tmp/rac-err-~a.txt" (random 1000000)))
+         (proc (sb-ext:run-program (first argv) (rest argv)
                                    :input input
-                                   :output :stream
-                                   :error :stream
+                                   :output out-file
+                                   :error err-file
+                                   :if-output-exists :supersede
+                                   :if-error-exists :supersede
                                    :wait nil
-                                   :search t))
-         (out-stream (sb-ext:process-output proc))
-         (err-stream (sb-ext:process-error proc)))
+                                   :search t)))
     (unwind-protect
          (progn
            (when timeout
@@ -376,28 +377,24 @@ Kills after TIMEOUT seconds and always closes process streams."
                (when (sb-ext:process-alive-p proc)
                  (sb-ext:process-kill proc 9 :pid)
                  (sleep 0.2))))
-
            (sb-ext:process-wait proc)
-
-           (flet ((slurp (stream)
-                    (when stream
-                      (with-output-to-string (result)
-                        (loop for line = (read-line stream nil nil)
-                              while line
-                              do (write-line line result))))))
-             (values (sb-ext:process-exit-code proc)
-                     (slurp out-stream)
-                     (slurp err-stream))))
-
-      ;; Важно: освобождаем pipe от stdout/stderr curl.
-      (ignore-errors (when out-stream (close out-stream)))
-      (ignore-errors (when err-stream (close err-stream)))
-
-      ;; Страховка на случай исключения посреди теста.
+           (values (sb-ext:process-exit-code proc)
+                   (when (probe-file out-file)
+                     (with-open-file (s out-file :direction :input)
+                       (let ((data (make-string (file-length s))))
+                         (read-sequence data s)
+                         data)))
+                   (when (probe-file err-file)
+                     (with-open-file (s err-file :direction :input)
+                       (let ((data (make-string (file-length s))))
+                         (read-sequence data s)
+                         data)))))
       (ignore-errors
        (when (sb-ext:process-alive-p proc)
          (sb-ext:process-kill proc 9 :pid)))
-      (ignore-errors (sb-ext:process-wait proc)))))  
+      (ignore-errors (sb-ext:process-wait proc))
+      (ignore-errors (delete-file out-file))
+      (ignore-errors (delete-file err-file)))))
 
   ;;; ---------------------------------------------------------------------
   ;;; Speed test via SOCKS5
