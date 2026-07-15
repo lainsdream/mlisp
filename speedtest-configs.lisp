@@ -646,29 +646,27 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
 
 (defun speedtest-configs (uris &key (test-urls *test-urls*) (dl-timeout *download-timeout*)
                                     (jobs 1) (verbose t) (name "out"))
-  "Test every URI. Print ranked report. Returns result list."
+  "Test every URI, print a ranked report, and save result files."
   (format t "~%speedtest-configs: ~a URI~:p, ~a worker~:p, ~as timeout/each~%~%"
           (length uris) jobs dl-timeout)
   (force-output)
-  (let* ((total   (length uris))
+  (let* ((total (length uris))
          (counter (cons 0 (sb-thread:make-mutex)))
          (results (pmap-bounded
                    (lambda (uri)
                      (let ((idx (sb-thread:with-mutex ((cdr counter))
                                   (prog1 (car counter) (incf (car counter))))))
-                       (test-one-config uri
-                                        :test-urls   test-urls
-                                        :dl-timeout dl-timeout
-                                        :verbose    verbose
-                                        :index      (1+ idx)
-                                        :total      total)))
+                       (test-one-config uri :test-urls test-urls
+                                            :dl-timeout dl-timeout
+                                            :verbose verbose
+                                            :index (1+ idx)
+                                            :total total)))
                    uris
-                   :max-workers jobs)))
-    (let ((sorted (sort (copy-list results) #'>
-                        :key (lambda (r) (or (getf r :mbps) -1)))))
-      (write-sorted-configs sorted (format nil "vless-~a.txt" name) :vless)
-      (write-sorted-configs sorted (format nil "ss-~a.txt"    name) :shadowsocks)
-      (format t "  saved: vless-~a.txt, ss-~a.txt~%" name name)
-      (format t "────────────────────────────────────────────────────────~%~%"))
-    results))
+                   :max-workers jobs))
+         (sorted (sort results #'>
+                       :key (lambda (result) (or (getf result :mbps) -1)))))
+    (write-sorted-configs sorted (format nil "vless-~a.txt" name) :vless)
+    (write-sorted-configs sorted (format nil "ss-~a.txt" name) :shadowsocks)
+    (format t "saved: vless-~a.txt, ss-~a.txt~%" name name)
+    (values)))
 
