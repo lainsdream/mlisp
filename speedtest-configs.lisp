@@ -86,14 +86,6 @@
     (if pos (values (subseq str 0 pos) (subseq str (1+ pos)))
         (values str nil))))
 
-(defun file-tag (path-or-url)
-  "Extract base filename without extension from a path or URL,
-     e.g. '.../subscriptions/1.txt' -> \"1\"."
-  (let* ((last-slash (position #\/ path-or-url :from-end t))
-         (fname      (if last-slash (subseq path-or-url (1+ last-slash)) path-or-url))
-         (dot        (position #\. fname :from-end t)))
-    (if dot (subseq fname 0 dot) fname)))
-
 (defun str-split (str ch)
   "Split STR on every occurrence of CH; returns list of substrings."
   (loop with start = 0
