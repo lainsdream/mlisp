@@ -261,98 +261,119 @@
       (sb-bsd-sockets:socket-close sock)
       port)))
 
+(defun security-stream-fields (cfg extra security)
+  (cond
+    ((string= security "tls")
+     (list
+      (cons "security" "tls")
+      (cons "tlsSettings"
+            (list :obj
+                  (cons "serverName"
+                        (qval extra "sni" (proxy-config-host cfg)))
+                  (cons "allowInsecure" :false)))))
+
+    ((string= security "reality")
+     (list
+      (cons "security" "reality")
+      (cons "realitySettings"
+            (list :obj
+                  (cons "serverName"  (qval extra "sni" ""))
+                  (cons "fingerprint" (qval extra "fp" "chrome"))
+                  (cons "publicKey"   (qval extra "pbk" ""))
+                  (cons "shortId"     (qval extra "sid" ""))))))
+
+    (t nil)))
+
+(defun transport-stream-fields (cfg extra network)
+  (cond
+    ((string= network "ws")
+     (list
+      (cons "wsSettings"
+            (list :obj
+                  (cons "path" (qval extra "path" "/"))
+                  (cons "headers" (list :obj (cons "Host" (qval extra "host" (proxy-config-host cfg)))))))))
+
+    ((string= network "grpc")
+     (list
+      (cons "grpcSettings"
+            (list :obj
+                  (cons "serviceName" (qval extra "serviceName" ""))))))
+
+    (t nil)))
+
 (defun stream-settings (cfg)
   (let* ((extra    (proxy-config-extra cfg))
-         (network  (qval extra "type"     "tcp"))
-         (security (qval extra "security" "none"))
-         (fields   (list (cons "network" network))))
-    ;; security layer
-    (cond
-      ((string= security "tls")
-       (push (cons "security" "tls") fields)
-       (push (cons "tlsSettings"
-                   (list :obj
-                         (cons "serverName"    (qval extra "sni" (proxy-config-host cfg)))
-                         (cons "allowInsecure" :false)))
-             fields))
-      ((string= security "reality")
-       (push (cons "security" "reality") fields)
-       (push (cons "realitySettings"
-                   (list :obj
-                         (cons "serverName"  (qval extra "sni" ""))
-                         (cons "fingerprint" (qval extra "fp"  "chrome"))
-                         (cons "publicKey"   (qval extra "pbk" ""))
-                         (cons "shortId"     (qval extra "sid" ""))))
-             fields)))
-    ;; transport layer
-    (cond
-      ((string= network "ws")
-       (push (cons "wsSettings"
-                   (list :obj
-                         (cons "path"    (qval extra "path" "/"))
-                         (cons "headers" (list :obj
-                                               (cons "Host"
-                                                     (qval extra "host"
-                                                           (proxy-config-host cfg)))))))
-             fields))
-      ((string= network "grpc")
-       (push (cons "grpcSettings"
-                   (list :obj (cons "serviceName" (qval extra "serviceName" ""))))
-             fields)))
-    (cons :obj fields)))
+         (network  (qval extra "type" "tcp"))
+         (security (qval extra "security" "none")))
+    (cons :obj
+          (append
+           (list (cons "network" network))
+           (security-stream-fields cfg extra security)
+           (transport-stream-fields cfg extra network)))))
+
+(defun vless-outbound (cfg)
+  (let* ((flow (qval (proxy-config-extra cfg) "flow" ""))
+         (user
+           (list :obj
+                 (cons "id"         (proxy-config-uuid cfg))
+                 (cons "encryption" "none")
+                 (cons "flow"       flow)))
+         (server
+           (list :obj
+                 (cons "address" (proxy-config-host cfg))
+                 (cons "port"    (proxy-config-port cfg))
+                 (cons "users"   (list :arr user))))
+         (settings
+           (list :obj
+                 (cons "vnext" (list :arr server)))))
+    (list :obj
+          (cons "protocol"       "vless")
+          (cons "settings"       settings)
+          (cons "streamSettings" (stream-settings cfg))
+          (cons "tag"            "proxy"))))
+
+(defun shadowsocks-outbound (cfg)
+  (let* ((server
+           (list :obj
+                 (cons "address"  (proxy-config-host cfg))
+                 (cons "port"     (proxy-config-port cfg))
+                 (cons "method"   (proxy-config-method cfg))
+                 (cons "password" (proxy-config-password cfg))))
+         (settings
+           (list :obj
+                 (cons "servers" (list :arr server)))))
+    (list :obj
+          (cons "protocol" "shadowsocks")
+          (cons "settings" settings)
+          (cons "tag" "proxy"))))
+
+(defun proxy-outbound (cfg)
+  (ecase (proxy-config-kind cfg)
+    (:vless       (vless-outbound cfg))
+    (:shadowsocks (shadowsocks-outbound cfg))))
+
+(defun socks-inbound (port)
+  (list :obj
+        (cons "listen" "127.0.0.1")
+        (cons "port" port)
+        (cons "protocol" "socks")
+        (cons "settings"
+              (list :obj (cons "udp" :false)))))
 
 (defun build-xray-config (cfg socks-port)
-  (let ((outbound
-          (ecase (proxy-config-kind cfg)
-            (:vless
-             (list :obj
-                   (cons "protocol" "vless")
-                   (cons "settings"
-                         (list :obj
-                               (cons "vnext"
-                                     (list :arr
-                                           (list :obj
-                                                 (cons "address" (proxy-config-host cfg))
-                                                 (cons "port"    (proxy-config-port cfg))
-                                                 (cons "users"
-                                                       (list :arr
-                                                             (list :obj
-                                                                   (cons "id"         (proxy-config-uuid cfg))
-                                                                   (cons "encryption" "none")
-                                                                   (cons "flow"
-                                                                         (qval (proxy-config-extra cfg)
-                                                                               "flow" ""))))))))))
-                   (cons "streamSettings" (stream-settings cfg))
-                   (cons "tag" "proxy")))
-            (:shadowsocks
-             (list :obj
-                   (cons "protocol" "shadowsocks")
-                   (cons "settings"
-                         (list :obj
-                               (cons "servers"
-                                     (list :arr
-                                           (list :obj
-                                                 (cons "address"  (proxy-config-host     cfg))
-                                                 (cons "port"     (proxy-config-port     cfg))
-                                                 (cons "method"   (proxy-config-method   cfg))
-                                                 (cons "password" (proxy-config-password cfg)))))))
-                   (cons "tag" "proxy"))))))
-    (list :obj
-          (cons "log"
-                (list :obj (cons "loglevel" "warning")))
-          (cons "inbounds"
-                (list :arr
-                      (list :obj
-                            (cons "listen"   "127.0.0.1")
-                            (cons "port"     socks-port)
-                            (cons "protocol" "socks")
-                            (cons "settings" (list :obj (cons "udp" :false))))))
-          (cons "outbounds"
-                (list :arr outbound)))))
+  (list :obj
+        (cons "log"
+              (list :obj
+                    (cons "loglevel" "warning")))
+        (cons "inbounds"
+              (list :arr (socks-inbound socks-port)))
+        (cons "outbounds"
+              (list :arr (proxy-outbound cfg)))))
 
   ;;; ---------------------------------------------------------------------
   ;;; Process helpers
   ;;; ---------------------------------------------------------------------
+
 (defun run-and-capture (argv &key input timeout)
   "Run ARGV, return (values exit-code stdout stderr).
 Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output."
@@ -436,6 +457,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                         (and err
                              (> (length (string-trim '(#\Space #\Newline) err)) 0)
                              (string-trim '(#\Space #\Newline) err)))))))
+
 (defun speedtest-via-socks
     (socks-port &key
                   (urls *test-urls*)
@@ -663,8 +685,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                                             :total total)))
                    uris
                    :max-workers jobs))
-         (sorted (sort results #'>
-                       :key (lambda (result) (or (getf result :mbps) -1)))))
+         (sorted (sort results #'> :key (lambda (result) (or (getf result :mbps) -1)))))
     (write-sorted-configs sorted (format nil "vless-~a.txt" name) :vless)
     (write-sorted-configs sorted (format nil "ss-~a.txt" name) :shadowsocks)
     (format t "saved: vless-~a.txt, ss-~a.txt~%" name name)
