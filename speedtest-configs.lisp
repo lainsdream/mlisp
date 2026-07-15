@@ -672,23 +672,3 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
       (format t "────────────────────────────────────────────────────────~%~%"))
     results))
 
-  ;;; ---------------------------------------------------------------------
-  ;;; Argument parser & entry point
-  ;;; ---------------------------------------------------------------------
-
-(defun parse-argv ()
-  "Parse *posix-argv* rest. Returns (values jobs remaining-args)."
-  (let ((all  (rest sb-ext:*posix-argv*))
-        (jobs 1)
-        rest)
-    (loop with skip = nil
-          for a in all
-          do (cond
-               (skip        (setf skip nil))
-               ((string= a "-j")
-                (let ((nxt (cadr (member a all :test #'string=))))
-                  (when nxt (setf jobs (or (parse-integer nxt :junk-allowed t) 1)))
-                  (setf skip t)))
-               (t (push a rest))))
-    (values jobs (nreverse rest))))
-
