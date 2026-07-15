@@ -673,38 +673,6 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
     results))
 
   ;;; ---------------------------------------------------------------------
-  ;;; I/O helpers
-  ;;; ---------------------------------------------------------------------
-
-(defun read-uris-from-file (path)
-  (with-open-file (f path)
-    (loop for line = (read-line f nil nil)
-          while line
-          for trimmed = (string-trim '(#\Space #\Tab #\Return) line)
-          when (and (> (length trimmed) 0)
-                    (not (char= (char trimmed 0) #\;)))  ; ; = comment
-          collect trimmed)))
-
-(defun read-uris-from-stdin ()
-  (loop for line = (read-line *standard-input* nil nil)
-        while line
-        for trimmed = (string-trim '(#\Space #\Tab #\Return) line)
-        when (and (> (length trimmed) 0)
-                  (not (char= (char trimmed 0) #\;)))
-        collect trimmed))
-
-(defun read-uris-from-url (url)
-  "Fetch URL via curl and return list of trimmed, non-empty, non-comment lines."
-  (multiple-value-bind (code out err) (run-and-capture (list "curl" "-sS" "-L" url) :timeout 20)
-    (unless (and (eql code 0) out)
-      (error "read-uris-from-url: curl failed (exit=~a): ~a" code err))
-    (loop for line in (str-split out #\Newline)
-          for trimmed = (string-trim '(#\Space #\Tab #\Return) line)
-          when (and (> (length trimmed) 0)
-                    (not (char= (char trimmed 0) #\;)))
-          collect trimmed)))
-
-  ;;; ---------------------------------------------------------------------
   ;;; Argument parser & entry point
   ;;; ---------------------------------------------------------------------
 
