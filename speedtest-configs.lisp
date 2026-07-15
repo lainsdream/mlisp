@@ -692,10 +692,3 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                (t (push a rest))))
     (values jobs (nreverse rest))))
 
-
-(defun read-lines (path)
-  (with-open-file (f path :external-format :utf-8)
-    (loop for line = (read-line f nil nil)
-          while line
-          when (> (length (string-trim '(#\Space #\Tab) line)) 0)
-          collect line))) 
