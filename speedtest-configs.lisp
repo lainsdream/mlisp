@@ -571,6 +571,66 @@ Returns (values ip country) or (values nil nil) on any failure."
         (json-string-field out "country")))))
 
   ;;; ---------------------------------------------------------------------
+  ;;; Stability probe — repeated lightweight requests through the SAME
+  ;;; already-open socks proxy (no new xray process).
+  ;;; ---------------------------------------------------------------------
+
+(defparameter *stability-urls*
+  '("https://www.youtube.com/generate_204"
+    "https://www.gstatic.com/generate_204"))
+
+(defun stability-probe-once (socks-port url timeout)
+  "Lightweight GET through SOCKS-PORT. Returns (values ok ms err)."
+  (multiple-value-bind (code out err)
+      (run-and-capture (list "curl" "-sS" "-o" "/dev/null"
+                             "--socks5-hostname" (format nil "127.0.0.1:~a" socks-port)
+                             "--max-time" (princ-to-string timeout)
+                             "-w" "%{http_code} %{time_total}"
+                             url)
+                       :timeout (+ timeout 3))
+    (declare (ignore err))
+    (if (and (eql code 0) out)
+        (let* ((trimmed (string-trim '(#\Space #\Newline) out))
+               (parts   (last (str-split trimmed #\Space) 2)))
+          (if (= (length parts) 2)
+              (let* ((http-code (first parts))
+                     (seconds   (let ((*read-default-float-format* 'double-float))
+                                  (ignore-errors (read-from-string (second parts))))))
+                (if (and (member http-code '("200" "204") :test #'string=) seconds)
+                    (values t (* 1000 seconds) nil)
+                    (values nil nil (format nil "http=~a" http-code))))
+              (values nil nil (format nil "unexpected curl output: ~s" out))))
+        (values nil nil (format nil "curl exit=~a" code)))))
+
+(defun mean (lst) (/ (reduce #'+ lst) (float (length lst) 1.0d0)))
+
+(defun stddev (lst)
+  (let ((m (mean lst)))
+    (sqrt (mean (mapcar (lambda (x) (expt (- x m) 2)) lst)))))
+
+(defun test-config-stability (socks-port &key (urls *stability-urls*)
+                                              (rounds 5) (interval 1.5)
+                                              (timeout 5) (max-failures 1)
+                                              (max-jitter-ms 400.0d0)
+                                              (verbose t))
+  "Fires ROUNDS lightweight probes through SOCKS-PORT, spaced INTERVAL apart.
+Returns (values stable-p stats-plist)."
+  (let ((latencies '()) (failures 0) (n (length urls)))
+    (dotimes (i rounds)
+      (let ((url (nth (mod i n) urls)))
+        (multiple-value-bind (ok ms err) (stability-probe-once socks-port url timeout)
+          (if ok
+              (push ms latencies)
+              (progn (incf failures)
+                     (when verbose (format t "fail(~a) " err) (force-output))))))
+      (when (< i (1- rounds)) (sleep interval)))
+    (let* ((lat      (nreverse latencies))
+           (jit      (if (>= (length lat) 2) (stddev lat) 0.0d0))
+           (stable-p (and (<= failures max-failures) (< jit max-jitter-ms))))
+      (values stable-p (list :rounds rounds :failures failures
+                             :latencies-ms lat :jitter-ms jit)))))
+
+  ;;; ---------------------------------------------------------------------
   ;;; Test one URI end-to-end
   ;;; ---------------------------------------------------------------------
 
@@ -629,13 +689,24 @@ Returns (values ip country) or (values nil nil) on any failure."
                                                        (not (string= host-ip exit-ip)))))
                                  (when verbose
                                    (format t "~,2fMbps~%" mbps)
-                                   (format t "      >>> ~a~%" uri)
-                                   (force-output))
-                                 (list :uri uri :status :ok :cfg cfg
-                                       :seconds seconds :bytes bytes :mbps mbps
-                                       :host-ip host-ip :host-country host-country
-                                       :exit-ip exit-ip :exit-country exit-country
-                                       :multihop-p multihop-p))))
+                                   (format t "      stability ... ") (force-output))
+                                 (multiple-value-bind (stable-p stab-stats)
+                                     (test-config-stability socks-port :verbose verbose)
+                                   (when verbose
+                                     (format t "~a (fail=~a jitter=~,0fms)~%"
+                                             (if stable-p "STABLE" "UNSTABLE")
+                                             (getf stab-stats :failures)
+                                             (getf stab-stats :jitter-ms))
+                                     (format t "      >>> ~a~%" uri)
+                                     (force-output))
+                                   (list :uri uri
+                                         :status (if stable-p :stable :unstable)
+                                         :cfg cfg
+                                         :seconds seconds :bytes bytes :mbps mbps
+                                         :host-ip host-ip :host-country host-country
+                                         :exit-ip exit-ip :exit-country exit-country
+                                         :multihop-p multihop-p
+                                         :stability stab-stats)))))
                            (progn
                              (when verbose
                                (format t "FAIL (~a)~%" err)

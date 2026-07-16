@@ -111,7 +111,7 @@
                                                (handler-case
                                                    (test-one-config uri :verbose nil)
                                                  (error () nil))))
-                                         (when (and result (eq (getf result :status) :ok))
+                                         (when (and result (eq (getf result :status) :stable))
                                            (ignore-errors
                                             (write-sse stream output-lock "result"
                                                        (result-event-payload result))))

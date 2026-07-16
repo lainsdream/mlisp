@@ -30,7 +30,7 @@
       const serverLabel = item.host + ':' + item.port
         + (item.hostCountry ? ` (${item.hostCountry})` : '');
       const values = [
-        [item.mbps + ' Mbps', 'speed'],
+        [Math.floor(Number(item.mbps)) + ' Mbps', 'speed'],
         [item.tag || '—', 'tag'],
         [item.kind, ''],
         [serverLabel, ''],
