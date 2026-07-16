@@ -23,7 +23,7 @@
       (subseq buffer 0 (read-sequence buffer in)))))
 
 (defparameter *speedtest-js*
-  (read-file-as-string (merge-pathnames "speedtest.js" *server-directory*))
+  (read-file-as-string (merge-pathnames "index.js" *server-directory*))
   "Loaded once at startup; edit speedtest.js and restart the server to pick up changes.")
 
 (defparameter *speedtest-html*
