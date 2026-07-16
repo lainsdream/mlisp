@@ -76,7 +76,10 @@
           (cons "kind" (string-downcase (symbol-name (proxy-config-kind cfg))))
           (cons "host" (proxy-config-host cfg))
           (cons "port" (proxy-config-port cfg))
-          (cons "uri" (getf result :uri)))))
+          (cons "uri" (getf result :uri))
+          (cons "exitIp" (or (getf result :exit-ip) ""))
+          (cons "exitCountry" (or (getf result :exit-country) ""))
+          (cons "multihop" (if (getf result :multihop-p) t :false)))))
 
 (defun stream-speedtest (stream url)
   "Read URL, then send valid test results as SSE events while workers finish."

@@ -24,15 +24,20 @@
     body.replaceChildren();
     for (const item of rows) {
       const tr = document.createElement('tr');
+      const exitLabel = item.exitCountry
+        ? item.exitCountry + (item.multihop ? ' 🔀' : '')
+        : '—';
       const values = [
         [item.mbps + ' Mbps', 'speed'],
         [item.tag || '—', 'tag'],
         [item.kind, ''],
         [item.host + ':' + item.port, ''],
+        [exitLabel, 'exit'],
         [item.uri, 'config']
       ];
       for (const [value, className] of values) {
         const td = document.createElement('td'); td.textContent = value; td.className = className;
+        if (className === 'exit' && item.multihop) td.title = `Exit IP: ${item.exitIp} (отличается от IP сервера — трафик уходит через доп. хоп)`;
         tr.append(td);
       }
       const action = document.createElement('td');

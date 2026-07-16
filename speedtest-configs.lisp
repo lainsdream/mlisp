@@ -416,7 +416,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
 
 (defun speedtest-via-socks-once (socks-port &key (url (first *test-urls*)) (timeout *download-timeout*))
   "Download URL through local SOCKS5 on SOCKS-PORT; return (values ok seconds bytes mbps err)."
-  ;(format t "[speedtest] Starting download from ~A through SOCKS5 port ~A~%" url socks-port)
+                                        ;(format t "[speedtest] Starting download from ~A through SOCKS5 port ~A~%" url socks-port)
   (multiple-value-bind (code out err)
       (run-and-capture (list "curl"
                              "-sS" "-L"
@@ -469,7 +469,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                    ((and err
                          (search "http=429" err)
                          (rest remaining-urls))
-                    ;(format t "[speed HTTP 429; switching to ~A~%" (second remaining-urls))
+                                        ;(format t "[speed HTTP 429; switching to ~A~%" (second remaining-urls))
                     (force-output)
                     (attempt (rest remaining-urls)))
 
@@ -483,7 +483,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                              (search "curl exit=7"  err)
                              (search "curl exit=28" err))
                          (rest remaining-urls))
-                    ;(format t "[speedtest] ~A; switching to ~A~%" (subseq err 0 (min 60 (length err))) (second remaining-urls))
+                                        ;(format t "[speedtest] ~A; switching to ~A~%" (subseq err 0 (min 60 (length err))) (second remaining-urls))
                     (force-output)
                     (attempt (rest remaining-urls)))
 
@@ -523,6 +523,41 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
       (unless done
         (ignore-errors (sb-thread:terminate-thread th))))
     result))
+
+  ;;; ---------------------------------------------------------------------
+  ;;; Exit IP / geo lookup (multihop detection)
+  ;;; ---------------------------------------------------------------------
+
+(defun json-string-field (json key)
+  "Naive extraction of a top-level string field from a flat JSON object.
+Good enough for trusted, simple API responses (no escaped quotes in values)."
+  (let ((needle (format nil "\"~a\":\"" key)))
+    (let ((pos (search needle json)))
+      (when pos
+        (let* ((start (+ pos (length needle)))
+               (end   (position #\" json :start start)))
+          (when end (subseq json start end)))))))
+
+(defun resolve-ip (host)
+  "Resolve HOST to a dotted-quad string, or NIL if it fails."
+  (ignore-errors
+   (let ((addr (car (sb-bsd-sockets:host-ent-addresses
+                     (sb-bsd-sockets:get-host-by-name host)))))
+     (format nil "~{~d~^.~}" (coerce addr 'list)))))
+
+(defun exit-ip-info (socks-port &key (timeout 6))
+  "Query ip-api.com through the local SOCKS5 proxy on SOCKS-PORT.
+Returns (values ip country) or (values nil nil) on any failure."
+  (multiple-value-bind (code out err)
+      (run-and-capture (list "curl" "-sS"
+                             "--socks5-hostname" (format nil "127.0.0.1:~a" socks-port)
+                             "--max-time" (princ-to-string timeout)
+                             "http://ip-api.com/json?fields=status,country,query")
+                       :timeout (+ timeout 3))
+    (declare (ignore err))
+    (if (and (eql code 0) out (search "\"status\":\"success\"" out))
+        (values (json-string-field out "query") (json-string-field out "country"))
+        (values nil nil))))
 
   ;;; ---------------------------------------------------------------------
   ;;; Test one URI end-to-end
@@ -575,12 +610,20 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                          (speedtest-via-socks socks-port :urls test-urls :timeout dl-timeout)
                        (if ok
                            (progn
-                             (when verbose
-                               (format t "~,2fMbps~%" mbps)
-                               (format t "      >>> ~a~%" uri)
-                               (force-output))
-                             (list :uri uri :status :ok :cfg cfg
-                                   :seconds seconds :bytes bytes :mbps mbps))
+                             (multiple-value-bind (exit-ip exit-country)
+                                 (exit-ip-info socks-port)
+                               (let* ((host-ip (resolve-ip (proxy-config-host cfg)))
+                                      (multihop-p (and host-ip exit-ip
+                                                       (not (string= host-ip exit-ip)))))
+                                 (when verbose
+                                   (format t "~,2fMbps~%" mbps)
+                                   (format t "      >>> ~a~%" uri)
+                                   (force-output))
+                                 (list :uri uri :status :ok :cfg cfg
+                                       :seconds seconds :bytes bytes :mbps mbps
+                                       :host-ip host-ip
+                                       :exit-ip exit-ip :exit-country exit-country
+                                       :multihop-p multihop-p))))
                            (progn
                              (when verbose
                                (format t "FAIL (~a)~%" err)
@@ -615,4 +658,3 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                                  :name (format nil "speedtest-~a" i))))))
           (dolist (th threads) (ignore-errors (sb-thread:join-thread th))))
         (coerce results 'list))))
-
