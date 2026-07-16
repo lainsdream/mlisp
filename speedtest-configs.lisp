@@ -559,6 +559,17 @@ Returns (values ip country) or (values nil nil) on any failure."
         (values (json-string-field out "query") (json-string-field out "country"))
         (values nil nil))))
 
+(defun ip-geo-country (ip &key (timeout 5))
+  "Query ip-api.com directly (no proxy) for IP's country. Returns country string or NIL."
+  (when ip
+    (multiple-value-bind (code out err)
+        (run-and-capture (list "curl" "-sS" "--max-time" (princ-to-string timeout)
+                               (format nil "http://ip-api.com/json/~a?fields=status,country" ip))
+                         :timeout (+ timeout 3))
+      (declare (ignore err))
+      (when (and (eql code 0) out (search "\"status\":\"success\"" out))
+        (json-string-field out "country")))))
+
   ;;; ---------------------------------------------------------------------
   ;;; Test one URI end-to-end
   ;;; ---------------------------------------------------------------------
@@ -613,6 +624,7 @@ Returns (values ip country) or (values nil nil) on any failure."
                              (multiple-value-bind (exit-ip exit-country)
                                  (exit-ip-info socks-port)
                                (let* ((host-ip (resolve-ip (proxy-config-host cfg)))
+                                      (host-country (ip-geo-country host-ip))
                                       (multihop-p (and host-ip exit-ip
                                                        (not (string= host-ip exit-ip)))))
                                  (when verbose
@@ -621,7 +633,7 @@ Returns (values ip country) or (values nil nil) on any failure."
                                    (force-output))
                                  (list :uri uri :status :ok :cfg cfg
                                        :seconds seconds :bytes bytes :mbps mbps
-                                       :host-ip host-ip
+                                       :host-ip host-ip :host-country host-country
                                        :exit-ip exit-ip :exit-country exit-country
                                        :multihop-p multihop-p))))
                            (progn

@@ -27,13 +27,14 @@
       const exitLabel = item.exitCountry
         ? item.exitCountry + (item.multihop ? ' 🔀' : '')
         : '—';
+      const serverLabel = item.host + ':' + item.port
+        + (item.hostCountry ? ` (${item.hostCountry})` : '');
       const values = [
         [item.mbps + ' Mbps', 'speed'],
         [item.tag || '—', 'tag'],
         [item.kind, ''],
-        [item.host + ':' + item.port, ''],
+        [serverLabel, ''],
         [exitLabel, 'exit'],
-        [item.uri, 'config']
       ];
       for (const [value, className] of values) {
         const td = document.createElement('td'); td.textContent = value; td.className = className;

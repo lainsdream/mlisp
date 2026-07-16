@@ -1,10 +1,6 @@
 ;;;; server.lisp -- local web UI for xray speed tests
 ;;;; Start with: sbcl --load server.lisp
 
-(defpackage :lserver
-  (:use :cl))
-(in-package :lserver)
-
 (defparameter *server-directory*
   (make-pathname :directory (pathname-directory
                              (or *load-truename* *default-pathname-defaults*))))
@@ -76,6 +72,7 @@
           (cons "kind" (string-downcase (symbol-name (proxy-config-kind cfg))))
           (cons "host" (proxy-config-host cfg))
           (cons "port" (proxy-config-port cfg))
+          (cons "hostCountry" (or (getf result :host-country) ""))
           (cons "uri" (getf result :uri))
           (cons "exitIp" (or (getf result :exit-ip) ""))
           (cons "exitCountry" (or (getf result :exit-country) ""))
