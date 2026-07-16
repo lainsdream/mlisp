@@ -14,11 +14,7 @@
 
 (defparameter *xray-path* "/opt/homebrew/bin/xray")
 (defparameter *test-urls*
-  '(
-    "https://speed.cloudflare.com/__down?bytes=10000000"
-    "https://proof.ovh.net/files/10Mb.dat"
-                                        ;"https://speed.hetzner.de/10MB.bin"
-    ))
+  '("https://speed.cloudflare.com/__down?bytes=10000000" "https://proof.ovh.net/files/10Mb.dat"))
 (defparameter *download-timeout* 5)  ; seconds per config
 (defparameter *script-dir* (make-pathname :directory (pathname-directory (or *load-truename* *default-pathname-defaults*))))
 
@@ -45,34 +41,39 @@
             (vector-push-extend (code-char (logand (ash bits (- nbits)) #xFF)) out)))
     (coerce out 'simple-string)))
 
+(defun write-utf8-octets (octets stream)
+  (when (plusp (length octets))
+    (write-string
+     (sb-ext:octets-to-string
+      (coerce octets '(simple-array (unsigned-byte 8) (*)))
+      :external-format :utf-8)
+     stream)
+    (setf (fill-pointer octets) 0)))
+
 (defun url-decode (str)
-  "Decode %XX percent-escapes as UTF-8 byte sequences; pass through any
-   already-literal (non-percent-encoded) characters unchanged."
-  (let ((out     (make-array 0 :element-type 'character :adjustable t :fill-pointer 0))
-        (pending (make-array 0 :element-type '(unsigned-byte 8) :adjustable t :fill-pointer 0)))
-    (flet ((flush-pending ()
-             (when (> (length pending) 0)
-               (loop for ch across (sb-ext:octets-to-string
-                                    (coerce pending '(simple-array (unsigned-byte 8) (*)))
-                                    :external-format :utf-8)
-                     do (vector-push-extend ch out))
-               (setf (fill-pointer pending) 0))))
+  "Decode percent-escaped UTF-8 bytes, preserving literal characters."
+  (with-output-to-string (out)
+    (let ((pending
+            (make-array 0
+                        :element-type '(unsigned-byte 8)
+                        :adjustable t
+                        :fill-pointer 0)))
       (loop with i = 0
             while (< i (length str))
-            do (let ((ch (char str i)))
-                 (cond
-                   ((and (char= ch #\%) (< (+ i 2) (length str))
-                         (digit-char-p (char str (1+ i)) 16)
-                         (digit-char-p (char str (+ i 2)) 16))
-                    (vector-push-extend (parse-integer str :start (1+ i) :end (+ i 3) :radix 16)
-                                        pending)
-                    (incf i 3))
-                   (t
-                    (flush-pending)
-                    (vector-push-extend ch out)
-                    (incf i)))))
-      (flush-pending))
-    (coerce out 'simple-string)))
+            for ch = (char str i)
+            if (and (char= ch #\%)
+                    (< (+ i 2) (length str))
+                    (digit-char-p (char str (1+ i)) 16)
+                    (digit-char-p (char str (+ i 2)) 16))
+            do (vector-push-extend
+                (parse-integer str :start (1+ i) :end (+ i 3) :radix 16)
+                pending)
+               (incf i 3)
+            else
+            do (write-utf8-octets pending out)
+               (write-char ch out)
+               (incf i)
+            finally (write-utf8-octets pending out)))))
 
 (defun split-once (str ch)
   "Split STR at first CH. Returns (values before after) or (values str nil)."
@@ -415,7 +416,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
 
 (defun speedtest-via-socks-once (socks-port &key (url (first *test-urls*)) (timeout *download-timeout*))
   "Download URL through local SOCKS5 on SOCKS-PORT; return (values ok seconds bytes mbps err)."
-  (format t "[speedtest] Starting download from ~A through SOCKS5 port ~A~%" url socks-port)
+  ;(format t "[speedtest] Starting download from ~A through SOCKS5 port ~A~%" url socks-port)
   (multiple-value-bind (code out err)
       (run-and-capture (list "curl"
                              "-sS" "-L"
@@ -468,9 +469,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                    ((and err
                          (search "http=429" err)
                          (rest remaining-urls))
-                    (format t
-                            "[speedtest] HTTP 429; switching to ~A~%"
-                            (second remaining-urls))
+                    ;(format t "[speed HTTP 429; switching to ~A~%" (second remaining-urls))
                     (force-output)
                     (attempt (rest remaining-urls)))
 
@@ -484,10 +483,7 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                              (search "curl exit=7"  err)
                              (search "curl exit=28" err))
                          (rest remaining-urls))
-                    (format t
-                            "[speedtest] ~A; switching to ~A~%"
-                            (subseq err 0 (min 60 (length err)))
-                            (second remaining-urls))
+                    ;(format t "[speedtest] ~A; switching to ~A~%" (subseq err 0 (min 60 (length err))) (second remaining-urls))
                     (force-output)
                     (attempt (rest remaining-urls)))
 
@@ -619,67 +615,4 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                                  :name (format nil "speedtest-~a" i))))))
           (dolist (th threads) (ignore-errors (sb-thread:join-thread th))))
         (coerce results 'list))))
-
-  ;;; ---------------------------------------------------------------------
-  ;;; Report
-  ;;; ---------------------------------------------------------------------
-
-(defun format-result (r)
-  (let ((cfg (getf r :cfg)))
-    (flet ((tag () (if cfg (proxy-config-tag cfg) "?")))
-      (case (getf r :status)
-        (:ok
-         (format nil "OK    ~8,2f Mbps  (~4,1fs  ~8d B)  ~a"
-                 (getf r :mbps) (getf r :seconds) (getf r :bytes) (tag)))
-        (:tcp-dead
-         (format nil "DEAD  tcp unreachable              ~a" (tag)))
-        (:xray-failed-to-start
-         (format nil "FAIL  xray crashed                 ~a" (tag)))
-        (:proxy-dead
-         (format nil "FAIL  no traffic (~30a)  ~a" (getf r :error) (tag)))
-        (:unparseable
-         (format nil "SKIP  bad URI                      ~a" (getf r :uri)))
-        (t
-         (format nil "???   ~s" r))))))
-
-(defun write-sorted-configs (sorted-results out-path kind)
-  "Записывает OK-результаты вида KIND (:vless | :shadowsocks) из уже
-     отсортированных SORTED-RESULTS в OUT-PATH, в том же формате что и консоль."
-  (with-open-file (f (merge-pathnames out-path *script-dir*)
-                     :direction :output
-                     :if-exists :supersede
-                     :if-does-not-exist :create)
-    (dolist (r sorted-results)
-      (when (and (eq (getf r :status) :ok)
-                 (eq (proxy-config-kind (getf r :cfg)) kind))
-        (format f "  ~a~%~a~%~%" (format-result r) (getf r :uri))))))
-
-  ;;; ---------------------------------------------------------------------
-  ;;; Main orchestrator
-  ;;; ---------------------------------------------------------------------
-
-(defun speedtest-configs (uris &key (test-urls *test-urls*) (dl-timeout *download-timeout*)
-                                    (jobs 1) (verbose t) (name "out"))
-  "Test every URI, print a ranked report, and save result files."
-  (format t "~%speedtest-configs: ~a URI~:p, ~a worker~:p, ~as timeout/each~%~%"
-          (length uris) jobs dl-timeout)
-  (force-output)
-  (let* ((total (length uris))
-         (counter (cons 0 (sb-thread:make-mutex)))
-         (results (pmap-bounded
-                   (lambda (uri)
-                     (let ((idx (sb-thread:with-mutex ((cdr counter))
-                                  (prog1 (car counter) (incf (car counter))))))
-                       (test-one-config uri :test-urls test-urls
-                                            :dl-timeout dl-timeout
-                                            :verbose verbose
-                                            :index (1+ idx)
-                                            :total total)))
-                   uris
-                   :max-workers jobs))
-         (sorted (sort results #'> :key (lambda (result) (or (getf result :mbps) -1)))))
-    (write-sorted-configs sorted (format nil "vless-~a.txt" name) :vless)
-    (write-sorted-configs sorted (format nil "ss-~a.txt" name) :shadowsocks)
-    (format t "saved: vless-~a.txt, ss-~a.txt~%" name name)
-    (values)))
 

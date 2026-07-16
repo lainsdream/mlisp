@@ -1,0 +1,43 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Xray speedtest</title>
+  <style>
+    :root { color-scheme: dark; }
+    body { max-width: 1100px; margin: 2rem auto; padding: 0 1rem;
+           font: 16px system-ui, sans-serif; background: #121417; color: #e8eaed; }
+    h1 { margin-bottom: .25rem; }
+    form { display: flex; gap: .7rem; margin: 1.5rem 0 .65rem; }
+    input { flex: 1; min-width: 0; padding: .7rem .8rem; color: inherit;
+            background: #20242a; border: 1px solid #5d6673; border-radius: .4rem; }
+    button { padding: .7rem 1rem; border: 0; border-radius: .4rem; cursor: pointer;
+             color: #07120b; background: #69dc96; font-weight: 700; }
+    button:disabled { opacity: .55; cursor: wait; }
+    #status { min-height: 1.5em; color: #aeb7c3; }
+    table { width: 100%; border-collapse: collapse; margin-top: 1rem; }
+    th, td { padding: .65rem .5rem; text-align: left; border-bottom: 1px solid #303640;
+             vertical-align: top; }
+    th { color: #aeb7c3; font-size: .83rem; text-transform: uppercase; }
+    td.tag, td.config { max-width: 30rem; overflow: hidden; text-overflow: ellipsis;
+                        white-space: nowrap; }
+    .speed { color: #69dc96; font-variant-numeric: tabular-nums; font-weight: 700; }
+    .copy { color: #dce8ff; background: #303b4d; font-size: .82rem; padding: .35rem .55rem; }
+    .empty { color: #aeb7c3; text-align: center; padding: 1.2rem; }
+  </style>
+</head>
+<body>
+  <h1>Xray speedtest</h1>
+  <p>Укажите прямую ссылку на текстовый список <code>vless://</code> и <code>ss://</code> конфигов.</p>
+  <form id="test-form">
+    <input id="url" type="url" required placeholder="https://example.org/configs.txt" autocomplete="url">
+    <button id="run" type="submit">Speedtest</button>
+  </form>
+  <div id="status">Готов к запуску.</div>
+  <table>
+    <thead><tr><th>Скорость</th><th>Имя</th><th>Тип</th><th>Сервер</th><th>Конфиг</th><th></th></tr></thead>
+    <tbody id="results"><tr><td class="empty" colspan="6">Валидные конфиги появятся здесь.</td></tr></tbody>
+  </table>
+<script src="/speedtest.js"></script>
+</body></html>
