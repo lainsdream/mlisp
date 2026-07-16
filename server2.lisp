@@ -169,7 +169,7 @@
 
 (defvar *server-socket* nil)
 
-(defun start-simple-server (&optional (port 4242))
+(defun start (&optional (port 4242))
   (setf *speedtest-stop-requested* nil)
   (let ((socket (make-instance 'sb-bsd-sockets:inet-socket :type :stream :protocol :tcp)))
     (setf *server-socket* socket)
@@ -197,4 +197,4 @@
     (setf *server-socket* nil)
     (format t "Speedtest server stopped.~%")))
 
-(start-simple-server 4242)
+(start)
