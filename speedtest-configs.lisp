@@ -630,6 +630,26 @@ Returns (values stable-p stats-plist)."
       (values stable-p (list :rounds rounds :failures failures
                              :latencies-ms lat :jitter-ms jit)))))
 
+(defun graceful-kill (proc &key (grace-period 1.0))
+  "Terminate PROC cleanly: SIGTERM first, giving it GRACE-PERIOD seconds
+to close its own connections (e.g. the proxy session to the test server),
+falling back to SIGKILL only if it's still alive after that. A hard
+SIGKILL drops the TCP/TLS session to the proxy server without a proper
+close, which can leave the server-side connection slot lingering past
+its timeout — some public servers cap concurrent connections per IP, so
+an abrupt teardown here can make a perfectly live config look 'already
+connected, refused' the next time you actually try to use it (e.g. in
+v2box) shortly after a speedtest run."
+  (when (sb-ext:process-alive-p proc)
+    (sb-ext:process-kill proc 15 :pid) ; SIGTERM
+    (let ((deadline (+ (get-internal-real-time)
+                       (* grace-period internal-time-units-per-second))))
+      (loop while (and (sb-ext:process-alive-p proc)
+                       (< (get-internal-real-time) deadline))
+            do (sleep 0.05)))
+    (when (sb-ext:process-alive-p proc)
+      (sb-ext:process-kill proc 9 :pid))))
+
   ;;; ---------------------------------------------------------------------
   ;;; Test one URI end-to-end
   ;;; ---------------------------------------------------------------------
@@ -712,8 +732,7 @@ Returns (values stable-p stats-plist)."
                                (format t "FAIL (~a)~%" err)
                                (force-output))
                              (list :uri uri :status :proxy-dead :cfg cfg :error err)))))))
-          (when (sb-ext:process-alive-p proc)
-            (sb-ext:process-kill proc 9 :pid))
+          (graceful-kill proc)
           (sb-ext:process-wait proc)
           (ignore-errors (delete-file config-path)))))))
 
