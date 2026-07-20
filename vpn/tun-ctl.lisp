@@ -1,13 +1,12 @@
 ;;; tun-ctl.lisp — добавляется поверх твоего singbox-ctl.lisp
-(defparameter *tun2socks-bin* "/usr/local/bin/tun2socks")
-(defparameter *tun-process* nil)
+(defparameter *priv-helper-bin* "/usr/local/libexec/lisp-vpn-priv")
 (defparameter *tun-name* "utun9")           ; можно любое свободное имя
 (defparameter *tun-ip* "198.18.0.1/15")     ; произвольная приватная подсеть, не пересекающаяся с локальной сетью
-(defparameter *proxy-server-ip* "82.38.31.46") ; IP твоего shadowsocks-сервера — ВАЖНО его исключить из туннеля
+(defparameter *proxy-server-ip* "82.38.31.149") ; IP твоего shadowsocks-сервера — ВАЖНО его исключить из туннеля
 (defparameter *original-gateway* nil)
-(defparameter *original-interface* nil)
 
 ;; --- узнать текущий default gateway, чтобы потом восстановить ---
+;; Остаётся непривилегированным: это только чтение состояния, ничего не меняет.
 (defun capture-original-route ()
   (let ((output (with-output-to-string (s)
                   (sb-ext:run-program "/sbin/route" (list "-n" "get" "default")
@@ -18,60 +17,50 @@
             (string-trim " " (second (uiop:split-string line :separator '(#\:))))))
     (format t "~&Original gateway: ~a~%" *original-gateway*)))
 
+;; --- единая точка вызова root-хелпера lisp-vpn-priv ---
+(defun privileged (&rest arguments)
+  (let ((proc (sb-ext:run-program "/usr/bin/sudo"
+                                  (append (list "-n" *priv-helper-bin*) arguments)
+                                  :output *standard-output* :error :output
+                                  :input nil :wait t)))
+    (unless (zerop (sb-ext:process-exit-code proc))
+      (error "lisp-vpn-priv failed: ~{~a~^ ~}" arguments))))
+
 ;; --- исключить IP прокси-сервера из туннеля, чтобы не было петли ---
 (defun exclude-proxy-server ()
-  (sb-ext:run-program "/usr/bin/sudo"
-                      (list "/sbin/route" "add" *proxy-server-ip* *original-gateway*)
-                      :output *standard-output* :error :output :wait t))
+  (privileged "add-proxy-route" *proxy-server-ip* *original-gateway*))
 
-
-;; --- назначить IP интерфейсу и сделать его default route ---
+;; --- сделать TUN-интерфейс default route ---
 (defun set-default-route ()
-  (sb-ext:run-program "/usr/bin/sudo" (list "/sbin/route" "delete" "default")
-                      :output *standard-output* :error :output :wait t)
-  (let ((proc (sb-ext:run-program "/usr/bin/sudo" (list "/sbin/route" "add" "default" "198.18.0.1")
-                                  :output *standard-output* :error :output :wait t)))
-    (unless (zerop (sb-ext:process-exit-code proc))
-      (format t "~&WARNING: failed to set default route via TUN, restoring original~%")
-      (sb-ext:run-program "/usr/bin/sudo" (list "/sbin/route" "add" "default" *original-gateway*)
-                          :output *standard-output* :error :output :wait t))))
+  (privileged "enable-tun-default"))
 
-;; --- откат --
+;; --- откат ---
 (defun restore-route ()
-  (let ((gw (or *original-gateway* "192.168.0.1")))
-    (sb-ext:run-program "/usr/bin/sudo" (list "/sbin/route" "delete" "default")
-                        :output *standard-output* :error :output :wait t)
-    (sb-ext:run-program "/usr/bin/sudo" (list "/sbin/route" "add" "default" gw)
-                        :output *standard-output* :error :output :wait t)
+  ;; Do not invent a gateway. A missing captured gateway is an error.
+  (unless *original-gateway*
+    (error "Cannot restore route: original gateway was never captured"))
+  ;; unwind-protect: даже если restore-default упадёт, всё равно пробуем
+  ;; убрать host-route для прокси-сервера, чтобы частичный сбой не оставлял
+  ;; его висеть. ignore-errors на очистке — чтобы неудачный cleanup не
+  ;; маскировал исходную ошибку restore-default.
+  (unwind-protect
+       (privileged "restore-default" *original-gateway*)
     (when *proxy-server-ip*
-      (sb-ext:run-program "/usr/bin/sudo" (list "/sbin/route" "delete" *proxy-server-ip*)
-                          :output *standard-output* :error :output :wait t))))
+      (ignore-errors (privileged "remove-proxy-route" *proxy-server-ip*)))))
 
 (defun assign-tun-ip ()
-  (sb-ext:run-program "/usr/bin/sudo"
-                      (list "/sbin/ifconfig" *tun-name* "198.18.0.1" "198.18.0.1" "up")
-                      :output *standard-output* :error :output :wait t))
-
-(defun stop-tun ()
-  (find-and-kill-by-name "tun2socks")
-  (setf *tun-process* nil)
-  (restore-route)
-  (format t "~&Routes restored~%"))
+  (privileged "assign-tun" *tun-name*))
 
 ;; --- запустить tun2socks ---
 (defun start-tun ()
-  (setf *tun-process*
-        (sb-ext:run-program "/usr/bin/sudo"
-                            (list *setsid-bin* *tun2socks-bin*
-                                  "-d" (format nil "tun://~a" *tun-name*)
-                                  "-p" "socks5://127.0.0.1:1080")
-                            :output "/tmp/tun2socks.log"
-                            :error :output
-                            :input nil
-                            :if-output-exists :supersede
-                            :wait nil))
-  (format t "~&tun2socks started, pid ~a~%" (sb-ext:process-pid *tun-process*))
+  (privileged "start-tun" *tun-name*)
+  (format t "~&tun2socks started~%")
   (sleep 2))
+
+(defun stop-tun ()
+  (restore-route)
+  (privileged "stop-tun")
+  (format t "~&Routes restored~%"))
 
 ;; --- полный запуск: sing-box + tun2socks + routing ---
 (defun start-full ()
