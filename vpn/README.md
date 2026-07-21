@@ -26,12 +26,33 @@ singbox-ctl.lisp:  sb-ext:run-program → setsid → sing-box   (без sudo)
 tun-ctl.lisp:       sb-ext:run-program → sudo -n → lisp-vpn-priv <subcommand>
 ```
 
+- `dog.lisp` — единственный файл, который нужно загружать руками: сам
+  подтягивает `singbox-ctl.lisp` и `tun-ctl.lisp` по своему собственному
+  расположению (`*load-truename*`), так что не важно, из какой директории
+  его грузишь. Добавляет поверх ручного `start-full`/`stop-full` один
+  watcher-поток на два дела, проверяемых на каждом тике, чтобы они не
+  могли гоняться друг за другом:
+  1. **Живость прокси** — TCP-коннект на `*proxy-server-ip*:*proxy-server-port*`
+     раз в `*poll-interval*` секунд; `*fail-threshold*` неудач подряд →
+     `(stop-full)` и откат на прямое соединение без VPN, чтобы не остаться
+     совсем без интернета; `*revive-threshold*` успехов подряд в этом
+     fallback-режиме → `(start-full)` снова.
+  2. **Смена сети** — Wi-Fi выключили/включили, машина уснула/проснулась,
+     переключились на другую сеть. Определяется по статусу/IP
+     `*watched-interface*` плюс по разрыву в wall-clock между тиками (не
+     все Mac честно репортят статус Wi-Fi сквозь sleep). Если туннель
+     должен быть поднят, захваченный ранее gateway протухает — форсируется
+     `(stop-full)` + `(start-full)`, не дожидаясь, пока это тем временем
+     заметит liveness-проверка.
+
 - `lisp-vpn-priv.c` — исходник самого хелпера, `*priv-helper-bin*` в
   `tun-ctl.lisp`. Небольшой C-бинарник с фиксированным списком сабкоманд
-  (`add-proxy-route`, `remove-proxy-route`, `enable-tun-default`,
-  `restore-default`, `assign-tun`, `start-tun`, `stop-tun`), который сам,
-  уже будучи root, вызывает `route`/`ifconfig`/`tun2socks` по абсолютным
-  путям, без шелла. Компилируется и ставится в
+  (`setup-routes`, `teardown-routes`, `assign-tun`, `start-tun`,
+  `stop-tun`), который сам, уже будучи root, вызывает
+  `route`/`ifconfig`/`tun2socks` по абсолютным путям, без шелла.
+  `setup-routes`/`teardown-routes` — каждая одна атомарная операция
+  (host-route на прокси + смена default route за один вызов), а не
+  раздельные add/remove/enable/restore шаги. Компилируется и ставится в
   `/usr/local/libexec/lisp-vpn-priv` — см. «Сборка root-хелпера» ниже.
 
 ## Как это работает
@@ -159,11 +180,15 @@ sudo -n /usr/local/libexec/lisp-vpn-priv 2>&1
 - Хелпер может менять только default route и один IPv4 host-route — этого
   достаточно для его задачи, но не более: он не умеет исполнять произвольные
   программы от root.
-- Оригинальный gateway (`*original-gateway*`) по-прежнему захватывает и
-  хранит **Lisp** (`capture-original-route` в `tun-ctl.lisp`), не хелпер —
-  это не atomic-транзакция на уровне сети. Следующий шаг hardening'а (пока
-  не сделан) — чтобы хелпер сам захватывал и переживал исходный gateway,
-  и сам делал setup/rollback.
+- Оригинальный gateway нигде не живёт в Lisp — ни как переменная, ни как
+  аргумент, который Lisp передаёт хелперу. Хелпер сам читает
+  `route -n get default` в момент `setup-routes`, сам хранит результат в
+  root-owned `/var/run/lisp-vpn-original-gw` и сам же его читает обратно
+  в `teardown-routes`. Lisp физически не может передать хелперу
+  устаревший или подделанный gateway, потому что никогда его не держит в
+  руках — это и есть ответ на прежнюю версию этого пункта (раньше
+  gateway захватывал и хранил Lisp, это было не atomic; теперь захват и
+  rollback целиком на стороне хелпера).
 
 ## Конфиг
 
@@ -188,6 +213,18 @@ URI в этом же репо).
 сломалось, интернет не работает".
 
 ## Использование
+
+Основной способ — через `dog.lisp`, с автоматическим watcher'ом:
+
+```lisp
+(load "dog.lisp")
+(connect)     ; поднимает всё: sing-box → tun2socks → маршруты → watcher
+(watch?)      ; текущий режим (:tunnel / :direct), статус потока, интерфейс
+(disconnect)  ; останавливает watcher, дожидается его, откатывает всё
+```
+
+Ручной способ — без watcher'а, только сам туннель, если авто-failover и
+детект смены сети не нужны:
 
 ```lisp
 (load "singbox-ctl.lisp")
