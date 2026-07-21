@@ -54,12 +54,12 @@ It can test several configurations concurrently and can keep test traffic outsid
 
 Main files:
 
-| File | Purpose |
-| --- | --- |
-| [`speedtest-configs.lisp`](speedtest-configs.lisp) | URI parsing, temporary `xray-core` configuration, connectivity and throughput testing |
-| [`speedweb.lisp`](speedweb.lisp) | Local HTTP server and SSE progress stream |
-| [`index.html`](index.html) / [`index.js`](index.js) | Browser UI |
-| [`io.lisp`](io.lisp) | Input helpers |
+| File                                                | Purpose                                                                               |
+| --------------------------------------------------- | ------------------------------------------------------------------------------------- |
+| [`test.lisp`](test.lisp)                            | URI parsing, temporary `xray-core` configuration, connectivity and throughput testing |
+| [`web.lisp`](web.lisp)                              | Local HTTP server and SSE progress stream                                             |
+| [`index.html`](index.html) / [`index.js`](index.js) | Browser UI                                                                            |
+| [`io.lisp`](io.lisp)                                | Input helpers                                                                         |
 
 ## Requirements
 
@@ -86,8 +86,8 @@ See [`vpn/README.md`](vpn/README.md) and [`vpn/priv/README.md`](vpn/priv/README.
 .
 ├── vpn/                     # TUN VPN controller and documentation
 │   └── priv/                # narrow root helper written in C
-├── speedtest-configs.lisp   # configuration test runner
-├── speedweb.lisp            # local web server
+├── test.lisp   # configuration test runner
+├── web.lisp            # local web server
 ├── index.html               # speed-test UI
 ├── index.js                 # browser client
 └── io.lisp                  # shared input helpers

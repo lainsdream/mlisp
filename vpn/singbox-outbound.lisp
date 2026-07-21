@@ -1,7 +1,7 @@
 ;;;; singbox-outbound.lisp
 ;;;;
 ;;;; Sing-box's outbound JSON schema, not xray's. Same proxy-config struct
-;;;; and parse-config-uri as speedtest-configs.lisp (loaded below if not
+;;;; and parse-config-uri as test.lisp (loaded below if not
 ;;;; already present) — only the JSON shape differs: sing-box puts
 ;;;; server/server_port/uuid directly on the outbound object, and TLS/
 ;;;; reality/transport are nested under tls/transport instead of xray's
@@ -16,7 +16,7 @@
 (let ((here (or *load-truename* *load-pathname*
                 (error "singbox-outbound.lisp must be loaded via (load ...)"))))
   (unless (fboundp 'parse-config-uri)
-    (load (merge-pathnames "../speedtest-configs.lisp" here))))
+    (load (merge-pathnames "../common/parse.lisp" here))))
 
 ;;; --- sing-box outbound builders ---
 

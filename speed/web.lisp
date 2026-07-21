@@ -6,8 +6,8 @@
                              (or *load-truename* *default-pathname-defaults*))))
 
 ;; The two files are kept separate so the command-line runner remains usable.
-(load (merge-pathnames "speedtest-configs.lisp" *server-directory*))
-(load (merge-pathnames "io.lisp" *server-directory*))
+(load (merge-pathnames "test.lisp" *server-directory*))
+(load (merge-pathnames "../common/io.lisp" *server-directory*))
 
 (defparameter *speedtest-jobs* 8
   "Max concurrent config tests. Two separate ceilings to balance:
