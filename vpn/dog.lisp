@@ -37,13 +37,71 @@
                 (error "dog.lisp must be loaded via (load ...), not evaluated form by form — ~
                         *load-truename* is how it finds singbox-ctl.lisp and tun-ctl.lisp next to it"))))
   (load (merge-pathnames "singbox-ctl.lisp" here))
-  (load (merge-pathnames "tun-ctl.lisp" here)))
+  (load (merge-pathnames "tun-ctl.lisp" here))
+  (load (merge-pathnames "singbox-outbound.lisp" here)))
 
 ;;; --- config: proxy liveness ---
 
 (defparameter *proxy-server-port* 8080
   "Port of the currently active proxy server. Update this alongside
    *proxy-server-ip* whenever you switch configs.")
+
+;;; --- config: server pool ---
+;;;
+;;; Each entry is a complete, ready-to-use sing-box config file (following
+;;; the tag:\"proxy\"/detour:\"proxy\"/mixed-inbound-1080 contract from the
+;;; README) plus the ip/port needed to TCP-check it directly. Deliberately
+;;; NOT multiple outbounds in one file behind urltest: that would need
+;;; lisp-vpn-priv to exclude several IPs from the tunnel at once, which it
+;;; doesn't support today, and touching that is a bigger, riskier change
+;;; than swapping one file for another. Exactly one outbound is ever live
+;;; at a time, so *proxy-server-ip* stays a single value, unchanged.
+(defparameter *server-list-path* "/tmp/servers.txt"
+  "One vless:// or ss:// URI per line, # for comments/blank lines ignored.
+   See singbox-outbound.lisp's read-uri-lines/load-server-pool.")
+
+(defparameter *pool-config-dir* "/tmp/pool-configs/"
+  "Where load-server-pool writes one complete sing-box config file per
+   entry in *server-list-path*.")
+
+(defun try-load-server-pool ()
+  "Wraps load-server-pool so a missing/unreadable *server-list-path* never
+   aborts loading the rest of dog.lisp — everything below this point
+   (watch, connect, cycle...) must still get defined even on a fresh
+   checkout with no servers.txt yet. Degrades to an empty pool instead,
+   which the sweep logic in cycle already treats as \"nothing to try,
+   fall back to direct on first failure\" — the same behavior as before
+   the pool existed at all."
+  (handler-case (load-server-pool *server-list-path* *pool-config-dir*)
+    (error (e)
+      (format t "~&[dog] couldn't load ~a (~a) — starting with an empty pool.~%~
+                 [dog] create it (one vless:// or ss:// URI per line) and call ~
+                 (reload-server-pool) when ready.~%"
+              *server-list-path* e)
+      nil)))
+
+(defparameter *config-pool* (try-load-server-pool)
+  "List of (:label :path :ip :port) plists, one per line in
+   *server-list-path*, in the same order. Re-run (reload-server-pool) to
+   pick up changes to the .txt file without restarting the Lisp image.")
+
+(defun reload-server-pool ()
+  "Re-parse *server-list-path* into *config-pool*. Does NOT touch the
+   currently running tunnel or *pool-index* — only takes effect the next
+   time switch-to-config runs (i.e. next failure/sweep), so editing the
+   .txt file never itself causes a reconnect."
+  (setf *config-pool* (try-load-server-pool))
+  (format t "~&[dog] pool reloaded: ~a entries~%" (length *config-pool*)))
+
+(defparameter *pool-index* 0
+  "Index into *config-pool* of the currently active entry.")
+
+(defparameter *sweep-tries* 0
+  "How many distinct pool entries have failed in a row during the current
+   sweep. Reset to 0 the moment any check succeeds. Reaching (length
+   *config-pool*) means every entry has been tried and failed without a
+   single success in between — only then do we give up and fall back to
+   :direct, rather than after just one entry dies.")
 
 (defparameter *poll-interval* 5
   "Seconds between checks — both proxy liveness and network state are
@@ -100,6 +158,24 @@
 
 (defun server-alive-p ()
   (tcp-alive-p *proxy-server-ip* *proxy-server-port*))
+
+(defun switch-to-config (index)
+  "Point everything at *config-pool* entry INDEX and bring the tunnel up
+   on it: stop whatever's running, swap *config-path*/*proxy-server-ip*/
+   *proxy-server-port* to match, start-full again. Callers are
+   responsible for fail-count/sweep bookkeeping around this."
+  (let* ((entry (nth index *config-pool*)))
+    (unless entry
+      (error "No pool entry at index ~a (pool has ~a entries)"
+             index (length *config-pool*)))
+    (format t "~&[dog] switching to pool entry ~a: ~a (~a:~a)~%"
+            index (getf entry :label) (getf entry :ip) (getf entry :port))
+    (ignore-errors (stop-full))
+    (setf *config-path* (getf entry :path))
+    (setf *proxy-server-ip* (getf entry :ip))
+    (setf *proxy-server-port* (getf entry :port))
+    (start-full)
+    (setf *pool-index* index)))
 
 ;;; --- interface introspection (read-only, unprivileged) ---
 
@@ -177,7 +253,11 @@
                       ;; a moment later anyway when the interface comes back.
                       ((and reason (string= cur-if-status "active") (eq *regime* :tunnel))
                        (full-reconfigure reason)
-                       (setf fail-count 0 ok-count 0))
+                       ;; A network change isn't a pool-entry death — the same
+                       ;; server just got restarted on a fresh connection, so
+                       ;; don't let this count against how many sweep attempts
+                       ;; are left before giving up on the whole pool.
+                       (setf fail-count 0 ok-count 0 *sweep-tries* 0))
                       ;; Network changed but either we're in :direct fallback
                       ;; (nothing of ours is up to restart — let the normal
                       ;; revive-check below keep doing its job) or the
@@ -189,16 +269,30 @@
                        (ecase *regime*
                          (:tunnel
                           (if (server-alive-p)
-                              (setf fail-count 0)
+                              (progn (setf fail-count 0) (setf *sweep-tries* 0))
                               (progn
                                 (incf fail-count)
                                 (format t "~&[dog] server unreachable ~a/~a~%"
                                         fail-count *fail-threshold*)
                                 (when (>= fail-count *fail-threshold*)
-                                  (format t "~&[dog] server presumed dead, falling back to direct~%")
-                                  (ignore-errors (stop-full))
-                                  (setf fail-count 0 ok-count 0)
-                                  (setf *regime* :direct)))))
+                                  (incf *sweep-tries*)
+                                  (format t "~&[dog] pool entry ~a (~a) presumed dead (sweep ~a/~a)~%"
+                                          *pool-index*
+                                          (getf (nth *pool-index* *config-pool*) :label)
+                                          *sweep-tries* (length *config-pool*))
+                                  (setf fail-count 0)
+                                  (if (>= *sweep-tries* (length *config-pool*))
+                                      ;; Every entry in the pool has now failed in a
+                                      ;; row without a single success in between —
+                                      ;; only now do we give up on the tunnel
+                                      ;; entirely, not after just the first death.
+                                      (progn
+                                        (format t "~&[dog] whole pool exhausted, falling back to direct~%")
+                                        (ignore-errors (stop-full))
+                                        (setf ok-count 0 *sweep-tries* 0)
+                                        (setf *regime* :direct))
+                                      (let ((next (mod (1+ *pool-index*) (length *config-pool*))))
+                                        (ignore-errors (switch-to-config next))))))))
                          (:direct
                           (if (server-alive-p)
                               (progn
@@ -220,8 +314,23 @@
     (return-from watch))
   (setf *regime* :tunnel)
   (setf *running* t)
-  (setf *thread*
-        (sb-thread:make-thread #'cycle :name "dog"))
+  ;; sb-thread:make-thread does NOT inherit *standard-output* from the
+  ;; calling thread — a new thread gets the Lisp image's original
+  ;; top-level stream, not whatever stream SLIME/Swank has bound
+  ;; *standard-output* to for this particular REPL connection. Capture
+  ;; both streams here (in the caller's thread, where the binding is
+  ;; still the one you're looking at) and rebind them explicitly inside
+  ;; the new thread, or cycle's (format t ...) calls silently go
+  ;; somewhere you can't see.
+  (let ((out *standard-output*)
+        (err *error-output*))
+    (setf *thread*
+          (sb-thread:make-thread
+           (lambda ()
+             (let ((*standard-output* out)
+                   (*error-output* err))
+               (cycle)))
+           :name "dog")))
   (format t "~&Watching started~%"))
 
 (defun unwatch ()
@@ -241,7 +350,9 @@
 (defun connect ()
   "(load \"dog.lisp\") (connect) — the whole thing: sing-box, tun2socks,
    routes, and the watcher thread. Nothing else to load or call by hand."
-  (start-full)
+  (if *config-pool*
+      (switch-to-config 0)
+      (start-full))
   (watch))
 
 (defun disconnect ()

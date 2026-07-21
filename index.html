@@ -25,6 +25,10 @@
     .speed { color: #69dc96; font-variant-numeric: tabular-nums; font-weight: 700; }
     .copy { color: #dce8ff; background: #303b4d; font-size: .82rem; padding: .35rem .55rem; }
     .empty { color: #aeb7c3; text-align: center; padding: 1.2rem; }
+    .section-title { margin-top: 2.2rem; margin-bottom: .1rem; font-size: 1.1rem; color: #cfd5dd; }
+    .hint { color: #aeb7c3; font-size: .85rem; margin: 0 0 .4rem; }
+    #unstable-table tbody tr td { opacity: .82; }
+    .jitter { color: #e0a458; font-variant-numeric: tabular-nums; white-space: nowrap; }
   </style>
 </head>
 <body>
@@ -37,7 +41,14 @@
   <div id="status">Готов к запуску.</div>
   <table>
     <thead><tr><th>Скорость</th><th>Имя</th><th>Тип</th><th>Сервер</th><th>Exit</th><th></th></tr></thead>
-    <tbody id="results"><tr><td class="empty" colspan="7">Валидные конфиги появятся здесь.</td></tr></tbody>
+    <tbody id="results"><tr><td class="empty" colspan="6">Валидные конфиги появятся здесь.</td></tr></tbody>
+  </table>
+
+  <h2 class="section-title">Нестабильные</h2>
+  <p class="hint">Скачивание прошло успешно, но джиттер или потери проб выше порога — пригодны только для нетребовательных задач.</p>
+  <table id="unstable-table">
+    <thead><tr><th>Скорость</th><th>Имя</th><th>Тип</th><th>Сервер</th><th>Exit</th><th>Джиттер</th><th></th></tr></thead>
+    <tbody id="unstable-results"><tr><td class="empty" colspan="7">Нестабильных конфигов пока нет.</td></tr></tbody>
   </table>
 <script src="/speedtest.js"></script>
 </body></html>

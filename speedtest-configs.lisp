@@ -18,6 +18,16 @@
 (defparameter *download-timeout* 5)  ; seconds per config
 (defparameter *script-dir* (make-pathname :directory (pathname-directory (or *load-truename* *default-pathname-defaults*))))
 
+(defparameter *bypass-interface* nil
+  "Controls whether config tests bypass an active system VPN by sourcing
+outbound traffic from the physical network interface instead of letting it
+follow the OS default route (which a VPN typically hijacks).
+  NIL        -- auto-detect the physical interface's IPv4 address (macOS,
+                via `networksetup`) the first time it's needed, then cache it.
+  \"a.b.c.d\"  -- use this local IPv4 address explicitly (skip auto-detect).
+  :none      -- disable bypassing; tests go through whatever route the OS
+                picks (i.e. through the VPN if one is active).")
+
   ;;; ---------------------------------------------------------------------
   ;;; Small string / base64 helpers (no external deps)
   ;;; ---------------------------------------------------------------------
@@ -242,6 +252,52 @@
       (t nil))))
 
   ;;; ---------------------------------------------------------------------
+  ;;; De-duplicate config URIs
+  ;;; ---------------------------------------------------------------------
+  ;;;
+  ;;; Subscriptions commonly re-list the same underlying server account
+  ;;; under several display names / fingerprints / short-ids (e.g. one
+  ;;; VLESS uuid@host:port shown 5x as "0172", "0388", "[OpenRay] ...",
+  ;;; etc, differing only in cosmetic query params). Testing each of
+  ;;; those separately wastes a full TCP+xray+download+stability cycle
+  ;;; per copy for a result that will be near-identical. We dedupe on
+  ;;; the actual credential identity, not the raw URI string.
+
+(defun config-identity-key (uri)
+  "Key identifying which server account URI authenticates against,
+ignoring cosmetic differences (tag, fingerprint, short-id, transport
+type, etc). Two URIs with the same key are the same account on the same
+server for speedtesting purposes. Returns NIL if URI can't be parsed --
+callers should treat unparseable URIs as always-unique (never dedupe
+away something we failed to understand)."
+  (let ((cfg (ignore-errors (parse-config-uri uri))))
+    (when cfg
+      (list (proxy-config-kind cfg)
+            (string-downcase (proxy-config-host cfg))
+            (proxy-config-port cfg)
+            (ecase (proxy-config-kind cfg)
+              (:vless        (string-downcase (proxy-config-uuid cfg)))
+              (:shadowsocks  (cons (proxy-config-method cfg)
+                                   (proxy-config-password cfg))))))))
+
+(defun dedupe-uris (uris)
+  "Remove URIs that share a CONFIG-IDENTITY-KEY with an earlier URI in
+the list, keeping the first occurrence of each and preserving overall
+order. URIs that fail to parse are always kept as-is.
+Returns (values deduped-uris removed-count)."
+  (let ((seen (make-hash-table :test #'equal))
+        (removed 0))
+    (values
+     (loop for uri in uris
+           for key = (config-identity-key uri)
+           if (and key (gethash key seen))
+             do (incf removed)
+           else
+             collect uri
+             and do (when key (setf (gethash key seen) t)))
+     removed)))
+
+  ;;; ---------------------------------------------------------------------
   ;;; xray-core JSON config builder
   ;;; ---------------------------------------------------------------------
 
@@ -318,12 +374,15 @@
                  (cons "users"   (list :arr user))))
          (settings
            (list :obj
-                 (cons "vnext" (list :arr server)))))
-    (list :obj
-          (cons "protocol"       "vless")
-          (cons "settings"       settings)
-          (cons "streamSettings" (stream-settings cfg))
-          (cons "tag"            "proxy"))))
+                 (cons "vnext" (list :arr server))))
+         (send-through (bypass-local-ip)))
+    (append
+     (list :obj
+           (cons "protocol"       "vless")
+           (cons "settings"       settings)
+           (cons "streamSettings" (stream-settings cfg))
+           (cons "tag"            "proxy"))
+     (when send-through (list (cons "sendThrough" send-through))))))
 
 (defun shadowsocks-outbound (cfg)
   (let* ((server
@@ -334,11 +393,14 @@
                  (cons "password" (proxy-config-password cfg))))
          (settings
            (list :obj
-                 (cons "servers" (list :arr server)))))
-    (list :obj
-          (cons "protocol" "shadowsocks")
-          (cons "settings" settings)
-          (cons "tag" "proxy"))))
+                 (cons "servers" (list :arr server))))
+         (send-through (bypass-local-ip)))
+    (append
+     (list :obj
+           (cons "protocol" "shadowsocks")
+           (cons "settings" settings)
+           (cons "tag" "proxy"))
+     (when send-through (list (cons "sendThrough" send-through))))))
 
 (defun proxy-outbound (cfg)
   (ecase (proxy-config-kind cfg)
@@ -411,12 +473,145 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
       (ignore-errors (delete-file err-file)))))
 
   ;;; ---------------------------------------------------------------------
+  ;;; VPN bypass — source outbound traffic from the physical interface
+  ;;; ---------------------------------------------------------------------
+  ;;;
+  ;;; If a system-wide VPN is up, its virtual interface (utun*) usually grabs
+  ;;; the default route, so anything that doesn't explicitly pick a source
+  ;;; address -- our raw TCP probe, xray's own outbound dial, and the direct
+  ;;; (no-proxy) curl calls -- ends up tunneled through the VPN. That defeats
+  ;;; the point of testing configs "as seen from this machine's real network".
+  ;;; The fix is to bind/source those connections from the physical
+  ;;; interface's local IP explicitly.
+
+(defun detect-physical-local-ip ()
+  "Best-effort (macOS): return the IPv4 address of the first active,
+non-VPN network service (in `networksetup` service-order, e.g. Wi-Fi /
+Ethernet), skipping services with no IP or whose name suggests a VPN.
+Returns NIL if nothing usable is found (non-macOS, no networksetup, etc)."
+  (ignore-errors
+   (multiple-value-bind (code out err)
+       (run-and-capture (list "networksetup" "-listnetworkserviceorder") :timeout 3)
+     (declare (ignore err))
+     (when (eql code 0)
+       (let ((services
+               (loop for line in (str-split out #\Newline)
+                     ;; enabled services look like: "(1) Wi-Fi"
+                     when (and (> (length line) 1) (char= (char line 0) #\())
+                     collect (let ((close (position #\) line)))
+                               (and close (string-trim '(#\Space)
+                                                       (subseq line (1+ close))))))))
+         (dolist (service services)
+           (when (and service
+                      (not (search "VPN" service :test #'char-equal))
+                      (not (search "tun" service :test #'char-equal)))
+             (multiple-value-bind (c2 o2 e2)
+                 (run-and-capture (list "networksetup" "-getinfo" service) :timeout 3)
+               (declare (ignore e2))
+               (when (eql c2 0)
+                 (let* ((needle "IP address: ")
+                        (pos    (search needle o2)))
+                   (when pos
+                     (let* ((start (+ pos (length needle)))
+                            (end   (or (position #\Newline o2 :start start) (length o2)))
+                            (ip    (string-trim '(#\Space #\Return) (subseq o2 start end))))
+                       (when (and (> (length ip) 0) (not (string= ip "none")))
+                         (return-from detect-physical-local-ip ip))))))))))))))
+
+(defparameter *bypass-local-ip-cache* :unset)
+
+(defparameter *bypass-probe-host* "1.1.1.1"
+  "Known-reachable public IP used to sanity-check an auto-detected bypass address.")
+(defparameter *bypass-probe-port* 443)
+
+(defun local-ip-routes-out-p (ip &key (timeout 3))
+  "T if a TCP connect *sourced from* IP actually reaches the public internet.
+This matters because on macOS/BSD, routing is destination-based, not
+source-based: simply bind()-ing to the physical interface's address does
+NOT override the routing table. Many VPN clients install split-default
+routes (0.0.0.0/1 + 128.0.0.0/1) that are MORE specific than a plain
+0.0.0.0/0 and still win the lookup regardless of which local address the
+socket is bound to -- so a bind-only 'bypass' can silently make every
+connection fail instead of actually bypassing anything."
+  (let ((local-addr (parse-ipv4-string ip))
+        (remote-addr (parse-ipv4-string *bypass-probe-host*))
+        result done)
+    (when (and local-addr remote-addr)
+      (let ((th (sb-thread:make-thread
+                 (lambda ()
+                   (setf result
+                         (ignore-errors
+                          (let ((sock (make-instance 'sb-bsd-sockets:inet-socket
+                                                     :type :stream :protocol :tcp)))
+                            (unwind-protect
+                                 (progn
+                                   (sb-bsd-sockets:socket-bind sock local-addr 0)
+                                   (sb-bsd-sockets:socket-connect sock remote-addr *bypass-probe-port*)
+                                   t)
+                              (ignore-errors (sb-bsd-sockets:socket-close sock))))))
+                   (setf done t))
+                 :name "bypass-probe")))
+        (let ((deadline (+ (get-internal-real-time)
+                           (* timeout internal-time-units-per-second))))
+          (loop until (or done (>= (get-internal-real-time) deadline))
+                do (sleep 0.05)))
+        (unless done (ignore-errors (sb-thread:terminate-thread th)))))
+    result))
+
+(defun bypass-local-ip ()
+  "Return the local IPv4 address outbound test connections should be sourced
+from to bypass an active system VPN, or NIL to use the OS default route.
+See *BYPASS-INTERFACE*. Auto-detection is validated (see
+LOCAL-IP-ROUTES-OUT-P) before being trusted, and the outcome is cached:
+if the candidate address can't actually reach the internet on its own
+(typical when a VPN owns the default route via split-default routes),
+bypassing is disabled for the session instead of silently breaking every
+connection."
+  (cond
+    ((eq *bypass-interface* :none) nil)
+    ((stringp *bypass-interface*) *bypass-interface*)
+    (t (if (eq *bypass-local-ip-cache* :unset)
+           (setf *bypass-local-ip-cache*
+                 (let ((candidate (detect-physical-local-ip)))
+                   (cond
+                     ((null candidate) nil)
+                     ((local-ip-routes-out-p candidate) candidate)
+                     (t
+                      (format t "~&[bypass] physical interface ~a detected, but traffic sourced ~
+from it doesn't reach the internet directly -- your VPN likely owns the default route (possibly ~
+via split-default 0.0.0.0/1 + 128.0.0.0/1 routes, common in commercial VPN clients), which a plain ~
+socket bind can't override on macOS. Disabling bypass for this session; tests will go through the ~
+VPN. To really bypass it you'd need either sudo `route add -host <ip> -interface enX` per target, ~
+or a split-tunnel / per-app exclude rule in your VPN client.~%" candidate)
+                      (force-output)
+                      nil))))
+           *bypass-local-ip-cache*))))
+
+(defun parse-ipv4-string (s)
+  "Parse \"a.b.c.d\" into a vector #(a b c d), or NIL if S is not a valid
+dotted-quad IPv4 literal (also NIL if S is NIL)."
+  (when s
+    (ignore-errors
+     (let ((parts (str-split s #\.)))
+       (when (= (length parts) 4)
+         (let ((octets (mapcar #'parse-integer parts)))
+           (when (every (lambda (o) (<= 0 o 255)) octets)
+             (coerce octets 'vector))))))))
+
+  ;;; ---------------------------------------------------------------------
   ;;; Speed test via SOCKS5
   ;;; ---------------------------------------------------------------------
 
 (defun speedtest-via-socks-once (socks-port &key (url (first *test-urls*)) (timeout *download-timeout*))
-  "Download URL through local SOCKS5 on SOCKS-PORT; return (values ok seconds bytes mbps err)."
-                                        ;(format t "[speedtest] Starting download from ~A through SOCKS5 port ~A~%" url socks-port)
+  "Download URL through local SOCKS5 on SOCKS-PORT.
+Return (values ok seconds bytes mbps err partial-p).
+If *DOWNLOAD-TIMEOUT* is hit mid-transfer (curl exit=28) but a 200 status
+and some bytes already came through, this is treated as a PARTIAL success:
+mbps is estimated from what was actually transferred in that window rather
+than discarding the config outright. Oversold/rate-limited servers on
+public config lists are often reachable and do serve data, just slower
+than TIMEOUT allows for a full pull of the test file -- PARTIAL-P lets
+callers tell that case apart from a clean full-file download if they care to."
   (multiple-value-bind (code out err)
       (run-and-capture (list "curl"
                              "-sS" "-L"
@@ -427,29 +622,45 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
                              "-w" "%{http_code} %{size_download} %{time_total}"
                              url)
                        :timeout (+ timeout 5))
-    
-    (if (and (eql code 0) out)
-        (let* ((trimmed (string-trim '(#\Space #\Newline) out))
-               ;; curl sometimes prepends progress; the -w fields are always last
-               (parts   (last (str-split trimmed #\Space) 3)))
-          (if (= (length parts) 3)
-              (let* ((http-code (first parts))
-                     (bytes     (parse-integer (second parts) :junk-allowed t))
-                     (seconds   (let ((*read-default-float-format* 'double-float))
-                                  (ignore-errors (read-from-string (third parts))))))
-                (if (and (string= http-code "200") bytes (> bytes 0) seconds (> seconds 0))
-                    (values t seconds bytes
-                            (/ (* bytes 8.0d0) seconds 1000000.0d0)
-                            nil)
-                    (values nil nil nil nil
-                            (format nil "http=~a bytes=~a secs=~a" http-code bytes seconds))))
-              (values nil nil nil nil (format nil "unexpected curl output: ~s" out))))
-        (values nil nil nil nil
-                (format nil "curl exit=~a~@[; ~a~]"
-                        code
-                        (and err
-                             (> (length (string-trim '(#\Space #\Newline) err)) 0)
-                             (string-trim '(#\Space #\Newline) err)))))))
+    (let* ((trimmed (and out (string-trim '(#\Space #\Newline) out)))
+           ;; curl still evaluates -w on a --max-time abort (using whatever
+           ;; it collected before bailing), so parts may be present even
+           ;; when code /= 0.
+           (parts   (and trimmed (last (str-split trimmed #\Space) 3))))
+      (flet ((parsed-fields ()
+               (when (and parts (= (length parts) 3))
+                 (values (first parts)
+                         (parse-integer (second parts) :junk-allowed t)
+                         (let ((*read-default-float-format* 'double-float))
+                           (ignore-errors (read-from-string (third parts))))))))
+        (cond
+          ;; Clean full-file download.
+          ((eql code 0)
+           (multiple-value-bind (http-code bytes seconds) (parsed-fields)
+             (if (and http-code (string= http-code "200") bytes (> bytes 0) seconds (> seconds 0))
+                 (values t seconds bytes (/ (* bytes 8.0d0) seconds 1000000.0d0) nil nil)
+                 (values nil nil nil nil
+                         (format nil "http=~a bytes=~a secs=~a" http-code bytes seconds)
+                         nil))))
+          ;; Timed out mid-download: salvage a speed estimate if we actually
+          ;; got a 200 and some bytes; otherwise it's just dead/stuck and we
+          ;; fall through like before.
+          ((eql code 28)
+           (multiple-value-bind (http-code bytes seconds) (parsed-fields)
+             (if (and http-code (string= http-code "200") bytes (> bytes 0) seconds (> seconds 0))
+                 (values t seconds bytes (/ (* bytes 8.0d0) seconds 1000000.0d0) nil t)
+                 (values nil nil nil nil
+                         (format nil "curl exit=28 (timeout, no usable partial data; http=~a bytes=~a)"
+                                 http-code bytes)
+                         nil))))
+          (t
+           (values nil nil nil nil
+                   (format nil "curl exit=~a~@[; ~a~]"
+                           code
+                           (and err
+                                (> (length (string-trim '(#\Space #\Newline) err)) 0)
+                                (string-trim '(#\Space #\Newline) err)))
+                   nil)))))))
 
 (defun speedtest-via-socks
     (socks-port &key
@@ -496,16 +707,28 @@ Writes stdout/stderr to temp files to avoid pipe-buffer stalls with large output
   ;;; ---------------------------------------------------------------------
 
 (defun tcp-alive-p (host port &optional (timeout 4))
-  "Return T if TCP connect to HOST:PORT succeeds within TIMEOUT seconds."
+  "Return T if TCP connect to HOST:PORT succeeds within TIMEOUT seconds.
+If (BYPASS-LOCAL-IP) resolves to a usable address, the probe socket is bound
+to it first, so the connection goes out the physical interface even when a
+system VPN has taken over the default route."
   (let (result done)
     (let ((th (sb-thread:make-thread
                (lambda ()
                  (setf result
                        (handler-case
-                           (let ((sock (make-instance 'sb-bsd-sockets:inet-socket
-                                                      :type :stream :protocol :tcp)))
+                           (let ((sock      (make-instance 'sb-bsd-sockets:inet-socket
+                                                           :type :stream :protocol :tcp))
+                                 (local-ip  (parse-ipv4-string (bypass-local-ip))))
                              (unwind-protect
                                   (progn
+                                    (when local-ip
+                                      ;; Non-fatal: if bind fails (e.g. the
+                                      ;; interface's address changed since it
+                                      ;; was validated), fall back to an
+                                      ;; unbound connect rather than treating
+                                      ;; the whole probe as dead.
+                                      (ignore-errors
+                                       (sb-bsd-sockets:socket-bind sock local-ip 0)))
                                     (sb-bsd-sockets:socket-connect
                                      sock
                                      (car (sb-bsd-sockets:host-ent-addresses
@@ -560,11 +783,15 @@ Returns (values ip country) or (values nil nil) on any failure."
         (values nil nil))))
 
 (defun ip-geo-country (ip &key (timeout 5))
-  "Query ip-api.com directly (no proxy) for IP's country. Returns country string or NIL."
+  "Query ip-api.com directly (no proxy) for IP's country. Returns country string or NIL.
+Sourced from the physical interface (see BYPASS-LOCAL-IP) so it isn't answered
+from the VPN's exit point when a system VPN is active."
   (when ip
     (multiple-value-bind (code out err)
-        (run-and-capture (list "curl" "-sS" "--max-time" (princ-to-string timeout)
-                               (format nil "http://ip-api.com/json/~a?fields=status,country" ip))
+        (run-and-capture (append (list "curl" "-sS" "--max-time" (princ-to-string timeout))
+                                 (let ((bip (bypass-local-ip)))
+                                   (when bip (list "--interface" bip)))
+                                 (list (format nil "http://ip-api.com/json/~a?fields=status,country" ip)))
                          :timeout (+ timeout 3))
       (declare (ignore err))
       (when (and (eql code 0) out (search "\"status\":\"success\"" out))
@@ -654,87 +881,105 @@ v2box) shortly after a speedtest run."
   ;;; Test one URI end-to-end
   ;;; ---------------------------------------------------------------------
 
+(defparameter *console-lock* (sb-thread:make-mutex :name "speedtest-console")
+  "Serializes writes to the real console across parallel worker threads.
+TEST-ONE-CONFIG buffers all of its progress lines (including the ones
+FORMAT'd deep inside TEST-CONFIG-STABILITY / STABILITY-PROBE-ONCE, since
+those inherit whatever *STANDARD-OUTPUT* is dynamically bound to in the
+calling thread) into a private string stream, then flushes that whole
+buffer in one atomic write here. Without this, N parallel workers all
+FORMAT-ing to the same shared stream interleave character-by-character
+instead of line-by-line, which is what made the console log unreadable
+once *SPEEDTEST-JOBS* went above 1.")
+
 (defun test-one-config (uri &key (test-urls *test-urls*) (dl-timeout *download-timeout*)
                                  (verbose t) (index nil) (total nil))
-  (let* ((prefix (if (and index total)
+  (let* ((real-output *standard-output*)
+         (prefix (if (and index total)
                      (format nil "[~a/~a] " index total)
                      ""))
-         (cfg (ignore-errors (parse-config-uri uri))))
-    (unless cfg
-      (when verbose
-        (format t "~aSKIP  cannot parse: ~a~%" prefix uri)
-        (force-output))
-      (return-from test-one-config (list :uri uri :status :unparseable)))
-    
-    (when verbose
-      (format t "~aTCP   ~a (~a:~a) ..." prefix
-              (proxy-config-tag cfg) (proxy-config-host cfg) (proxy-config-port cfg))
-      (force-output))
-    
-    (unless (tcp-alive-p (proxy-config-host cfg) (proxy-config-port cfg))
-      (when verbose (format t " DEAD~%") (force-output))
-      (return-from test-one-config (list :uri uri :status :tcp-dead :cfg cfg)))
-    
-    (when verbose (format t " OK~%") (force-output))
-    
-    (let* ((socks-port  (free-local-port))
-           (xray-config (build-xray-config cfg socks-port))
-           (config-path (format nil "/tmp/xray-cfg-~a.json" socks-port)))
-      (with-open-file (f config-path :direction :output :if-exists :supersede)
-        (write-string (json-to-string xray-config) f))
-      (when verbose
-        (format t "~axray  ~a ... " prefix (proxy-config-tag cfg))
-        (force-output))
-      (let ((proc (sb-ext:run-program *xray-path*
-                                      (list "run" "-c" config-path)
-                                      :output nil :error nil :wait nil :search t)))
-        (unwind-protect
-             (progn
-               (sleep 0.8)
-               (if (not (sb-ext:process-alive-p proc))
+         (cfg (ignore-errors (parse-config-uri uri)))
+         (log-stream (and verbose (make-string-output-stream))))
+    (unwind-protect
+        (let ((*standard-output* (or log-stream *standard-output*)))
+          (unless cfg
+            (when verbose
+              (format t "~aSKIP  cannot parse: ~a~%" prefix uri)
+              (force-output))
+            (return-from test-one-config (list :uri uri :status :unparseable)))
+
+          (when verbose
+            (format t "~aTCP   ~a (~a:~a) ..." prefix
+                    (proxy-config-tag cfg) (proxy-config-host cfg) (proxy-config-port cfg))
+            (force-output))
+
+          (unless (tcp-alive-p (proxy-config-host cfg) (proxy-config-port cfg))
+            (when verbose (format t " DEAD~%") (force-output))
+            (return-from test-one-config (list :uri uri :status :tcp-dead :cfg cfg)))
+
+          (when verbose (format t " OK~%") (force-output))
+
+          (let* ((socks-port  (free-local-port))
+                 (xray-config (build-xray-config cfg socks-port))
+                 (config-path (format nil "/tmp/xray-cfg-~a.json" socks-port)))
+            (with-open-file (f config-path :direction :output :if-exists :supersede)
+              (write-string (json-to-string xray-config) f))
+            (when verbose
+              (format t "~axray  ~a ... " prefix (proxy-config-tag cfg))
+              (force-output))
+            (let ((proc (sb-ext:run-program *xray-path*
+                                            (list "run" "-c" config-path)
+                                            :output nil :error nil :wait nil :search t)))
+              (unwind-protect
                    (progn
-                     (when verbose (format t "xray failed to start~%") (force-output))
-                     (list :uri uri :status :xray-failed-to-start :cfg cfg))
-                   (progn
-                     (when verbose (format t "dl ... ") (force-output))
-                     (multiple-value-bind (ok seconds bytes mbps err)
-                         (speedtest-via-socks socks-port :urls test-urls :timeout dl-timeout)
-                       (if ok
-                           (progn
-                             (multiple-value-bind (exit-ip exit-country)
-                                 (exit-ip-info socks-port)
-                               (let* ((host-ip (resolve-ip (proxy-config-host cfg)))
-                                      (host-country (ip-geo-country host-ip))
-                                      (multihop-p (and host-ip exit-ip
-                                                       (not (string= host-ip exit-ip)))))
-                                 (when verbose
-                                   (format t "~,2fMbps~%" mbps)
-                                   (format t "      stability ... ") (force-output))
-                                 (multiple-value-bind (stable-p stab-stats)
-                                     (test-config-stability socks-port :verbose verbose)
+                     (sleep 0.8)
+                     (if (not (sb-ext:process-alive-p proc))
+                         (progn
+                           (when verbose (format t "xray failed to start~%") (force-output))
+                           (list :uri uri :status :xray-failed-to-start :cfg cfg))
+                         (progn
+                           (when verbose (format t "dl ... ") (force-output))
+                           (multiple-value-bind (ok seconds bytes mbps err)
+                               (speedtest-via-socks socks-port :urls test-urls :timeout dl-timeout)
+                             (if ok
+                                 (progn
+                                   (multiple-value-bind (exit-ip exit-country)
+                                       (exit-ip-info socks-port)
+                                     (let* ((host-ip (resolve-ip (proxy-config-host cfg)))
+                                            (host-country (ip-geo-country host-ip))
+                                            (multihop-p (and host-ip exit-ip
+                                                             (not (string= host-ip exit-ip)))))
+                                       (when verbose
+                                         (format t "~,2fMbps~%" mbps)
+                                         (format t "      stability ... ") (force-output))
+                                       (multiple-value-bind (stable-p stab-stats)
+                                           (test-config-stability socks-port :verbose verbose)
+                                         (when verbose
+                                           (format t "~a (fail=~a jitter=~,0fms)~%"
+                                                   (if stable-p "STABLE" "UNSTABLE")
+                                                   (getf stab-stats :failures)
+                                                   (getf stab-stats :jitter-ms))
+                                           (force-output))
+                                         (list :uri uri
+                                               :status (if stable-p :stable :unstable)
+                                               :cfg cfg
+                                               :seconds seconds :bytes bytes :mbps mbps
+                                               :host-ip host-ip :host-country host-country
+                                               :exit-ip exit-ip :exit-country exit-country
+                                               :multihop-p multihop-p
+                                               :stability stab-stats)))))
+                                 (progn
                                    (when verbose
-                                     (format t "~a (fail=~a jitter=~,0fms)~%"
-                                             (if stable-p "STABLE" "UNSTABLE")
-                                             (getf stab-stats :failures)
-                                             (getf stab-stats :jitter-ms))
-                                     (format t "      >>> ~a~%" uri)
+                                     (format t "FAIL (~a)~%" err)
                                      (force-output))
-                                   (list :uri uri
-                                         :status (if stable-p :stable :unstable)
-                                         :cfg cfg
-                                         :seconds seconds :bytes bytes :mbps mbps
-                                         :host-ip host-ip :host-country host-country
-                                         :exit-ip exit-ip :exit-country exit-country
-                                         :multihop-p multihop-p
-                                         :stability stab-stats)))))
-                           (progn
-                             (when verbose
-                               (format t "FAIL (~a)~%" err)
-                               (force-output))
-                             (list :uri uri :status :proxy-dead :cfg cfg :error err)))))))
-          (graceful-kill proc)
-          (sb-ext:process-wait proc)
-          (ignore-errors (delete-file config-path)))))))
+                                   (list :uri uri :status :proxy-dead :cfg cfg :error err)))))))
+                (graceful-kill proc)
+                (sb-ext:process-wait proc)
+                (ignore-errors (delete-file config-path))))))
+      (when log-stream
+        (sb-thread:with-mutex (*console-lock*)
+          (write-string (get-output-stream-string log-stream) real-output)
+          (force-output real-output))))))
 
   ;;; ---------------------------------------------------------------------
   ;;; Parallel map with bounded worker count

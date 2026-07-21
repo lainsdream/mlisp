@@ -2,7 +2,14 @@
 (defparameter *priv-helper-bin* "/usr/local/libexec/lisp-vpn-priv")
 (defparameter *tun-name* "utun9")           ; можно любое свободное имя
 (defparameter *tun-ip* "198.18.0.1/15")     ; произвольная приватная подсеть, не пересекающаяся с локальной сетью
-(defparameter *proxy-server-ip* "82.38.31.149") ; IP твоего shadowsocks-сервера — ВАЖНО его исключить из туннеля
+(defparameter *proxy-server-ip* nil
+  "IP текущего активного сервера — ВАЖНО исключить его из туннеля
+   host-route'ом. Само значение сюда не хардкодится: dog.lisp
+   перезаписывает его через (setf *proxy-server-ip* ...) в
+   switch-to-config при каждом переключении на новый пул-энтри, ещё до
+   первого start-full. Переменная объявлена здесь как special var,
+   потому что setup-routes/teardown-routes в этом файле — единственные
+   её потребители.")
 (defparameter *tun-start-timeout* 10
   "Seconds to wait for the TUN interface to actually appear after
    start-tun. lisp-vpn-priv's start-tun subcommand spawns tun2socks via
