@@ -252,16 +252,34 @@ sudo -n /usr/local/libexec/lisp-vpn-priv 2>&1
   "listen_port": 1080}`, совпадает с `*socks-port*` в `singbox-ctl.lisp`.
 
 Единственное, что меняется между разными конфигами — сам объект
-`outbounds[0]` (shadowsocks/vless/...), сгенерировать можно вручную или
-взять из `speedtest-configs.lisp` (парсер `vless://`/`ss://` URI в этом же
-репо — парсит URI в структуру `proxy-config`, но сам JSON-адаптер там
-сейчас написан под xray-core, не под sing-box; схемы разные, см. issue
-про multi-config failover).
+`outbounds[0]` (shadowsocks/vless/...).
 
-**`*proxy-server-ip*` в `tun-ctl.lisp` должен совпадать с `outbounds[0].server`
-в конфиге** — иначе будет петля (TUN пытается завернуть даже трафик к самому
-прокси). Забыть поменять при смене конфига — самая частая причина "всё
-сломалось, интернет не работает".
+Парсинг `vless://`/`ss://` URI в структуру `proxy-config` — общий код в
+`speedtest-configs.lisp`, используется и спидтестом, и сборкой боевого
+конфига. Сборка **sing-box**-JSON из этой структуры — отдельно, в
+`singbox-outbound.lisp` (`build-singbox-config`), не в
+`speedtest-configs.lisp`: там свой адаптер, но под **xray-core**
+(`build-xray-config`, нужен только для спидтеста через xray), схемы JSON
+у sing-box и xray разные, поэтому адаптеры два и они не взаимозаменяемы.
+
+Собирать конфиги вручную не нужно — `dog.lisp` делает это сам:
+`*server-list-path*` (по умолчанию `/tmp/servers.txt`, по одному
+`vless://`/`ss://` URI на строку, `#` для комментариев) читается
+`load-server-pool`'ом, который для каждой строки пишет готовый sing-box
+JSON в `*pool-config-dir*` (`/tmp/pool-configs/`) и складывает список
+`(:label :path :ip :port)` в `*config-pool*`. `(connect)` берёт из пула
+запись 0, `switch-to-config` при переключении сам синхронизирует
+`*config-path*` и `*proxy-server-ip*`/`*proxy-server-port*` с текущей
+записью — руками эти три переменные больше держать в синхроне не нужно,
+это было главным источником "забыл поменять IP — всё сломалось" до того,
+как появился пул.
+
+Если конфиг всего один и watcher/failover не нужен (ручной путь без
+`dog.lisp`, см. "Использование" ниже) — тогда синхронизация вручную
+всё ещё актуальна: **`*proxy-server-ip*` в `tun-ctl.lisp` должен
+совпадать с `outbounds[0].server`** в файле, на который указывает
+`*config-path*` в `singbox-ctl.lisp` — иначе будет петля (TUN пытается
+завернуть даже трафик к самому прокси).
 
 ## Использование
 
@@ -322,12 +340,13 @@ sudo networksetup -setairportpower en0 on
   `enable-tun-default`/`restore-default` этой проблемы не имеет, он делает
   `route change default ...` одной атомарной командой, а не delete+add, так
   что окна "default route вообще отсутствует" между шагами нет.
-- **`*tun-ip*` в `tun-ctl.lisp` сейчас ни на что не влияет** — реальный IP
-  TUN-интерфейса зашит в `lisp-vpn-priv.c` как `TUN_IP` (`198.18.0.1`,
-  используется и в `assign-tun`, и в `enable-tun-default`/`restore-default`).
-  `assign-tun-ip` передаёт хелперу только имя интерфейса (`*tun-name*`), не
-  IP. Поменять `*tun-ip*` в Lisp — ничего не изменит; чтобы реально сменить
-  подсеть, нужно менять `TUN_IP` в C-файле и пересобирать хелпер.
+- **Подсеть TUN-интерфейса задаётся не в Lisp, а в `lisp-vpn-priv.c`** — как
+  `TUN_IP` (`198.18.0.1`, используется и в `assign-tun`, и в
+  `enable-tun-default`/`restore-default`). `assign-tun-ip` передаёт хелперу
+  только имя интерфейса (`*tun-name*`). Чтобы сменить подсеть, нужно менять
+  `TUN_IP` в C-файле и пересобирать хелпер — Lisp-переменной для этого
+  больше нет (раньше был `*tun-ip*` в `tun-ctl.lisp`, но он ни на что не
+  влиял и был убран).
 - **`sudo`-обёрнутый процесс без `:input nil` в `run-program`** может зависать
   в статусе `T` (Stopped) — задаётся терминалом/tty-хендшейком. Всегда
   указывай `:input nil` для фоновых sudo-процессов.

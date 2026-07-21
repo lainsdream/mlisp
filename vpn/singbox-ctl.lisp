@@ -1,6 +1,12 @@
 (defparameter *setsid-bin* "/opt/homebrew/opt/util-linux/bin/setsid")
 (defparameter *singbox-bin* "/opt/homebrew/bin/sing-box")
-(defparameter *config-path* "/tmp/ss-config.json")
+(defparameter *config-path* nil
+  "Путь к JSON-конфигу sing-box. При работе через dog.lisp/connect
+   значение сюда не хардкодится — switch-to-config перезаписывает его
+   через (setf *config-path* ...) при каждом переключении на новый
+   пул-энтри, ещё до первого (start). При ручном пути (без dog.lisp)
+   присвой сам, например (setf *config-path* \"/tmp/ss-config.json\"),
+   до вызова (start)/(start-full).")
 (defparameter *log-path* "/tmp/singbox.log")
 (defparameter *socks-port* 1080
   "Must match listen_port of the `mixed`/socks inbound in *config-path* —
