@@ -204,23 +204,62 @@ sudo -n /usr/local/libexec/lisp-vpn-priv 2>&1
 
 ## Конфиг
 
-`*config-path*` в `singbox-ctl.lisp` указывает на JSON-конфиг sing-box —
-обычный формат с `inbounds`/`outbounds`, `inbound` всегда:
+`*config-path*` в `singbox-ctl.lisp` указывает на JSON-конфиг sing-box.
+Ниже — реально рабочий пример (shadowsocks), не урезанный: это полный
+файл, а не только фрагмент inbound'а.
 
 ```json
 {
-  "type": "mixed",
-  "listen": "127.0.0.1",
-  "listen_port": 1080
+  "log": { "level": "warn" },
+  "dns": {
+    "servers": [
+      {
+        "tag": "proxy-dns",
+        "type": "https",
+        "server": "1.1.1.1",
+        "detour": "proxy"
+      }
+    ]
+  },
+  "inbounds": [
+    { "type": "mixed", "listen": "127.0.0.1", "listen_port": 1080 }
+  ],
+  "outbounds": [
+    {
+      "type": "shadowsocks",
+      "tag": "proxy",
+      "server": "82.38.31.149",
+      "server_port": 8080,
+      "method": "chacha20-ietf-poly1305",
+      "password": "..."
+    }
+  ]
 }
 ```
 
-`outbound` — под конкретный протокол (shadowsocks/vless/...), сгенерировать
-можно вручную или взять из `speedtest-configs.lisp` (парсер `vless://`/`ss://`
-URI в этом же репо).
+**Секция `dns` обязательна, не опциональна.** Без неё DNS-запросы могут
+резолвиться в обход туннеля (обычный UDP:53 вместо DoH через прокси) —
+то есть сам трафик пойдёт через VPN, а какие домены ты резолвишь будет
+видно провайдеру напрямую. Это ровно та утечка, ради устранения которой
+и городится весь TUN+route setup, так что пропускать этот блок нельзя.
 
-**`*proxy-server-ip*` в `tun-ctl.lisp` должен совпадать с IP сервера в
-конфиге** — иначе будет петля (TUN пытается завернуть даже трафик к самому
+Три поля жёстко связаны друг с другом и должны совпадать при генерации
+любого нового конфига:
+- `outbounds[0].tag` — всегда `"proxy"`;
+- `dns.servers[0].detour` — всегда `"proxy"` (ссылается на тег outbound'а
+  по имени, а не по позиции);
+- `inbounds[0]` — всегда `{"type": "mixed", "listen": "127.0.0.1",
+  "listen_port": 1080}`, совпадает с `*socks-port*` в `singbox-ctl.lisp`.
+
+Единственное, что меняется между разными конфигами — сам объект
+`outbounds[0]` (shadowsocks/vless/...), сгенерировать можно вручную или
+взять из `speedtest-configs.lisp` (парсер `vless://`/`ss://` URI в этом же
+репо — парсит URI в структуру `proxy-config`, но сам JSON-адаптер там
+сейчас написан под xray-core, не под sing-box; схемы разные, см. issue
+про multi-config failover).
+
+**`*proxy-server-ip*` в `tun-ctl.lisp` должен совпадать с `outbounds[0].server`
+в конфиге** — иначе будет петля (TUN пытается завернуть даже трафик к самому
 прокси). Забыть поменять при смене конфига — самая частая причина "всё
 сломалось, интернет не работает".
 
