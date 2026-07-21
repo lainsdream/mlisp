@@ -3,6 +3,13 @@
 (defparameter *tun-name* "utun9")           ; можно любое свободное имя
 (defparameter *tun-ip* "198.18.0.1/15")     ; произвольная приватная подсеть, не пересекающаяся с локальной сетью
 (defparameter *proxy-server-ip* "82.38.31.149") ; IP твоего shadowsocks-сервера — ВАЖНО его исключить из туннеля
+(defparameter *tun-start-timeout* 10
+  "Seconds to wait for the TUN interface to actually appear after
+   start-tun. lisp-vpn-priv's start-tun subcommand spawns tun2socks via
+   setsid in the background and returns as soon as it's launched, not
+   once the interface exists — so `privileged` returning is not itself a
+   readiness signal, same reasoning as sing-box's SOCKS port in
+   singbox-ctl.lisp.")
 
 ;; Original gateway больше не живёт в Lisp вообще — ни как переменная, ни
 ;; как аргумент, который Lisp передаёт хелперу. lisp-vpn-priv сам читает
@@ -10,6 +17,15 @@
 ;; root-owned /var/run/lisp-vpn-original-gw, и сам же его читает обратно
 ;; в teardown-routes. Lisp не может передать хелперу устаревший или
 ;; подделанный gateway, потому что он его никогда не держит в руках.
+
+(defun tun-interface-up-p (name)
+  "True once NAME shows up as a real interface via ifconfig — this is the
+   actual readiness signal for start-tun, polled by wait-until (defined in
+   singbox-ctl.lisp, loaded before this file) instead of guessing with a
+   fixed sleep."
+  (zerop (sb-ext:process-exit-code
+          (sb-ext:run-program "/sbin/ifconfig" (list name)
+                              :output nil :error nil :wait t))))
 
 ;; --- единая точка вызова root-хелпера lisp-vpn-priv ---
 (defun privileged (&rest arguments)
@@ -38,8 +54,10 @@
 ;; --- запустить tun2socks ---
 (defun start-tun ()
   (privileged "start-tun" *tun-name*)
-  (format t "~&tun2socks started~%")
-  (sleep 2))
+  (wait-until (lambda () (tun-interface-up-p *tun-name*))
+              :timeout *tun-start-timeout*
+              :description (format nil "TUN interface ~a to appear" *tun-name*))
+  (format t "~&tun2socks started~%"))
 
 (defun stop-tun ()
   (privileged "stop-tun")
@@ -48,9 +66,7 @@
 ;; --- полный запуск: sing-box + tun2socks + routing ---
 (defun start-full ()
   (start)
-  (sleep 1)
   (start-tun)
-  (sleep 2)
   (assign-tun-ip)
   (setup-routes)
   (format t "~&Full TUN setup complete~%"))
