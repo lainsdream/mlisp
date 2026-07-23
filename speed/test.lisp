@@ -1,10 +1,11 @@
 ;;;; test.lisp
 ;;;;
-;;;; Takes a list of vless:// and ss:// config URIs, filters the ones that
-;;;; pass a raw TCP connect test, then for the survivors spins up a real
-;;;; xray-core instance (local SOCKS5 inbound + the config as outbound),
-;;;; downloads a test file through it, measures throughput, tears the
-;;;; process down, and ranks configs by real measured speed.
+;;;; Takes a list of vless://, trojan://, vmess:// and ss:// config URIs,
+;;;; filters the ones that pass a raw TCP connect test, then for the
+;;;; survivors spins up a real xray-core instance (local SOCKS5 inbound +
+;;;; the config as outbound), downloads a test file through it, measures
+;;;; throughput, tears the process down, and ranks configs by real
+;;;; measured speed.
 ;;;;
 ;;;; Requires: an `xray` binary on PATH (or set *xray-path*).
 ;;;; Only orchestrates xray-core -- does not reimplement VLESS/SS protocols.
@@ -13,6 +14,9 @@
 (require :sb-posix)
 
 (defparameter *xray-path* "/opt/homebrew/bin/xray")
+(defparameter *singbox-path* "/opt/homebrew/bin/sing-box"
+  "Only used for hysteria2 configs -- xray-core has no hysteria2 outbound,
+so those go through sing-box instead of xray (see TEST-ONE-CONFIG).")
 (defparameter *test-urls*
   '("https://speed.cloudflare.com/__down?bytes=10000000" "https://proof.ovh.net/files/10Mb.dat"))
 (defparameter *download-timeout* 5)  ; seconds per config
@@ -56,8 +60,11 @@ away something we failed to understand)."
             (proxy-config-port cfg)
             (ecase (proxy-config-kind cfg)
               (:vless        (string-downcase (proxy-config-uuid cfg)))
+              (:trojan       (proxy-config-password cfg))
+              (:vmess        (string-downcase (proxy-config-uuid cfg)))
               (:shadowsocks  (cons (proxy-config-method cfg)
-                                   (proxy-config-password cfg))))))))
+                                   (proxy-config-password cfg)))
+              (:hysteria2    (proxy-config-password cfg)))))))
 
 (defun dedupe-uris (uris)
   "Remove URIs that share a CONFIG-IDENTITY-KEY with an earlier URI in
@@ -181,9 +188,54 @@ Returns (values deduped-uris removed-count)."
            (cons "tag" "proxy"))
      (when send-through (list (cons "sendThrough" send-through))))))
 
+(defun trojan-outbound (cfg)
+  (let* ((server
+           (list :obj
+                 (cons "address"  (proxy-config-host cfg))
+                 (cons "port"     (proxy-config-port cfg))
+                 (cons "password" (proxy-config-password cfg))))
+         (settings
+           (list :obj
+                 (cons "servers" (list :arr server))))
+         (send-through (bypass-local-ip)))
+    (append
+     (list :obj
+           (cons "protocol"       "trojan")
+           (cons "settings"       settings)
+           (cons "streamSettings" (stream-settings cfg))
+           (cons "tag"            "proxy"))
+     (when send-through (list (cons "sendThrough" send-through))))))
+
+(defun vmess-outbound (cfg)
+  ;; No alterId: modern Xray-core is AEAD-only and the field is gone from
+  ;; its outbound schema entirely (the legacy MD5-AEAD mode is rejected at
+  ;; startup regardless), unlike sing-box which still exposes alter_id.
+  (let* ((user
+           (list :obj
+                 (cons "id"       (proxy-config-uuid cfg))
+                 (cons "security" (proxy-config-method cfg))))
+         (server
+           (list :obj
+                 (cons "address" (proxy-config-host cfg))
+                 (cons "port"    (proxy-config-port cfg))
+                 (cons "users"   (list :arr user))))
+         (settings
+           (list :obj
+                 (cons "vnext" (list :arr server))))
+         (send-through (bypass-local-ip)))
+    (append
+     (list :obj
+           (cons "protocol"       "vmess")
+           (cons "settings"       settings)
+           (cons "streamSettings" (stream-settings cfg))
+           (cons "tag"            "proxy"))
+     (when send-through (list (cons "sendThrough" send-through))))))
+
 (defun proxy-outbound (cfg)
   (ecase (proxy-config-kind cfg)
     (:vless       (vless-outbound cfg))
+    (:trojan      (trojan-outbound cfg))
+    (:vmess       (vmess-outbound cfg))
     (:shadowsocks (shadowsocks-outbound cfg))))
 
 (defun socks-inbound (port)
@@ -671,6 +723,62 @@ FORMAT-ing to the same shared stream interleave character-by-character
 instead of line-by-line, which is what made the console log unreadable
 once *SPEEDTEST-JOBS* went above 1.")
 
+(defun speedtest-through-proc (uri cfg proc socks-port config-path prefix verbose
+                                test-urls dl-timeout failed-to-start-status)
+  "Shared tail once PROC (xray or sing-box) has been launched listening on
+SOCKS-PORT: wait for it to come up, run the download speedtest, look up
+the exit IP, and probe stability. Always tears PROC down and deletes
+CONFIG-PATH, whatever the outcome. FAILED-TO-START-STATUS lets callers
+keep backend-specific status keywords (:xray-failed-to-start vs
+:singbox-failed-to-start)."
+  (unwind-protect
+      (progn
+        (sleep 0.8)
+        (if (not (sb-ext:process-alive-p proc))
+            (progn
+              (when verbose (format t "failed to start~%") (force-output))
+              (list :uri uri :status failed-to-start-status :cfg cfg))
+            (progn
+              (when verbose (format t "dl ... ") (force-output))
+              (multiple-value-bind (ok seconds bytes mbps err)
+                  (speedtest-via-socks socks-port :urls test-urls :timeout dl-timeout)
+                (if ok
+                    (multiple-value-bind (exit-ip exit-country)
+                        (exit-ip-info socks-port)
+                      (let* ((host-ip (resolve-ip (proxy-config-host cfg)))
+                             (host-country (ip-geo-country host-ip))
+                             (multihop-p (and host-ip exit-ip
+                                              (not (string= host-ip exit-ip)))))
+                        (when verbose
+                          (format t "~,2fMbps~%" mbps)
+                          (format t "      stability ... ") (force-output))
+                        (multiple-value-bind (stable-p stab-stats)
+                            (test-config-stability socks-port :verbose verbose)
+                          (when verbose
+                            (format t "~a (fail=~a jitter=~,0fms)~%"
+                                    (if stable-p "STABLE" "UNSTABLE")
+                                    (getf stab-stats :failures)
+                                    (getf stab-stats :jitter-ms))
+                            (force-output))
+                          (list :uri uri
+                                :status (if stable-p :stable :unstable)
+                                :cfg cfg
+                                :seconds seconds :bytes bytes :mbps mbps
+                                :host-ip host-ip :host-country host-country
+                                :exit-ip exit-ip :exit-country exit-country
+                                :multihop-p multihop-p
+                                :stability stab-stats))))
+                    (progn
+                      (when verbose
+                        (format t "FAIL (~a)~%" err)
+                        (force-output))
+                      (list :uri uri :status :proxy-dead :cfg cfg :error err)))))))
+    (graceful-kill proc)
+    (sb-ext:process-wait proc)
+    (ignore-errors (delete-file config-path))))
+
+(defun json-to-string (obj)
+  (with-output-to-string (s) (json-write obj s)))
 (defun test-one-config (uri &key (test-urls *test-urls*) (dl-timeout *download-timeout*)
                                  (verbose t) (index nil) (total nil))
   (let* ((real-output *standard-output*)
@@ -687,74 +795,53 @@ once *SPEEDTEST-JOBS* went above 1.")
               (force-output))
             (return-from test-one-config (list :uri uri :status :unparseable)))
 
-          (when verbose
-            (format t "~aTCP   ~a (~a:~a) ..." prefix
-                    (proxy-config-tag cfg) (proxy-config-host cfg) (proxy-config-port cfg))
-            (force-output))
+          (if (eq (proxy-config-kind cfg) :hysteria2)
+              ;; Hysteria2 is QUIC/UDP, not TCP -- xray-core has no
+              ;; outbound for it at all, so this goes through sing-box
+              ;; instead. Also skips the TCP-liveness check below: a
+              ;; plain TCP connect would misreport a live hysteria2
+              ;; server as dead since it isn't listening on TCP in the
+              ;; first place. sing-box actually coming up and passing
+              ;; traffic *is* the liveness check here.
+              (let* ((socks-port     (free-local-port))
+                     (singbox-config (build-singbox-config cfg :socks-port socks-port))
+                     (config-path    (format nil "/tmp/singbox-cfg-~a.json" socks-port)))
+                (with-open-file (f config-path :direction :output :if-exists :supersede)
+                  (write-string (json-to-string singbox-config) f))
+                (when verbose
+                  (format t "~asing-box ~a ... " prefix (proxy-config-tag cfg))
+                  (force-output))
+                (let ((proc (sb-ext:run-program *singbox-path*
+                                                (list "run" "-c" config-path)
+                                                :output nil :error nil :wait nil :search t)))
+                  (speedtest-through-proc uri cfg proc socks-port config-path prefix verbose
+                                          test-urls dl-timeout :singbox-failed-to-start)))
 
-          (unless (tcp-alive-p (proxy-config-host cfg) (proxy-config-port cfg))
-            (when verbose (format t " DEAD~%") (force-output))
-            (return-from test-one-config (list :uri uri :status :tcp-dead :cfg cfg)))
+              (progn
+                (when verbose
+                  (format t "~aTCP   ~a (~a:~a) ..." prefix
+                          (proxy-config-tag cfg) (proxy-config-host cfg) (proxy-config-port cfg))
+                  (force-output))
 
-          (when verbose (format t " OK~%") (force-output))
+                (unless (tcp-alive-p (proxy-config-host cfg) (proxy-config-port cfg))
+                  (when verbose (format t " DEAD~%") (force-output))
+                  (return-from test-one-config (list :uri uri :status :tcp-dead :cfg cfg)))
 
-          (let* ((socks-port  (free-local-port))
-                 (xray-config (build-xray-config cfg socks-port))
-                 (config-path (format nil "/tmp/xray-cfg-~a.json" socks-port)))
-            (with-open-file (f config-path :direction :output :if-exists :supersede)
-              (write-string (json-to-string xray-config) f))
-            (when verbose
-              (format t "~axray  ~a ... " prefix (proxy-config-tag cfg))
-              (force-output))
-            (let ((proc (sb-ext:run-program *xray-path*
-                                            (list "run" "-c" config-path)
-                                            :output nil :error nil :wait nil :search t)))
-              (unwind-protect
-                   (progn
-                     (sleep 0.8)
-                     (if (not (sb-ext:process-alive-p proc))
-                         (progn
-                           (when verbose (format t "xray failed to start~%") (force-output))
-                           (list :uri uri :status :xray-failed-to-start :cfg cfg))
-                         (progn
-                           (when verbose (format t "dl ... ") (force-output))
-                           (multiple-value-bind (ok seconds bytes mbps err)
-                               (speedtest-via-socks socks-port :urls test-urls :timeout dl-timeout)
-                             (if ok
-                                 (progn
-                                   (multiple-value-bind (exit-ip exit-country)
-                                       (exit-ip-info socks-port)
-                                     (let* ((host-ip (resolve-ip (proxy-config-host cfg)))
-                                            (host-country (ip-geo-country host-ip))
-                                            (multihop-p (and host-ip exit-ip
-                                                             (not (string= host-ip exit-ip)))))
-                                       (when verbose
-                                         (format t "~,2fMbps~%" mbps)
-                                         (format t "      stability ... ") (force-output))
-                                       (multiple-value-bind (stable-p stab-stats)
-                                           (test-config-stability socks-port :verbose verbose)
-                                         (when verbose
-                                           (format t "~a (fail=~a jitter=~,0fms)~%"
-                                                   (if stable-p "STABLE" "UNSTABLE")
-                                                   (getf stab-stats :failures)
-                                                   (getf stab-stats :jitter-ms))
-                                           (force-output))
-                                         (list :uri uri
-                                               :status (if stable-p :stable :unstable)
-                                               :cfg cfg
-                                               :seconds seconds :bytes bytes :mbps mbps
-                                               :host-ip host-ip :host-country host-country
-                                               :exit-ip exit-ip :exit-country exit-country
-                                               :multihop-p multihop-p
-                                               :stability stab-stats)))))
-                                 (progn
-                                   (when verbose
-                                     (format t "FAIL (~a)~%" err)
-                                     (force-output))
-                                   (list :uri uri :status :proxy-dead :cfg cfg :error err)))))))
-                (graceful-kill proc)
-                (sb-ext:process-wait proc)
-                (ignore-errors (delete-file config-path))))))
+                (when verbose (format t " OK~%") (force-output))
+
+                (let* ((socks-port  (free-local-port))
+                       (xray-config (build-xray-config cfg socks-port))
+                       (config-path (format nil "/tmp/xray-cfg-~a.json" socks-port)))
+                  (with-open-file (f config-path :direction :output :if-exists :supersede)
+                    (write-string (json-to-string xray-config) f))
+                  (when verbose
+                    (format t "~axray  ~a ... " prefix (proxy-config-tag cfg))
+                    (force-output))
+                  (let ((proc (sb-ext:run-program *xray-path*
+                                                  (list "run" "-c" config-path)
+                                                  :output nil :error nil :wait nil :search t)))
+                    (speedtest-through-proc uri cfg proc socks-port config-path prefix verbose
+                                            test-urls dl-timeout :xray-failed-to-start))))))
       (when log-stream
         (sb-thread:with-mutex (*console-lock*)
           (write-string (get-output-stream-string log-stream) real-output)
