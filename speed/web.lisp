@@ -7,7 +7,6 @@
 
 ;; The two files are kept separate so the command-line runner remains usable.
 (load (merge-pathnames "test.lisp" *server-directory*))
-(load (merge-pathnames "../common/io.lisp" *server-directory*))
 
 (defparameter *speedtest-jobs* 8
   "Max concurrent config tests. Two separate ceilings to balance:
@@ -45,6 +44,32 @@ same place your (start) call's output did."
   `(let ((*standard-output* (or *log-stream* *standard-output*))
          (*error-output* (or *log-error-stream* *error-output*)))
      ,@body))
+
+  ;;; ---------------------------------------------------------------------
+  ;;; I/O helpers
+  ;;; ---------------------------------------------------------------------
+
+(defparameter *uri-trim-chars*
+  '(#\Space #\Tab #\Return))
+
+(defun read-uris-from-stream (stream)
+  "Return trimmed non-empty, non-comment URI lines from STREAM."
+  (loop for line = (read-line stream nil nil)
+        while line
+        for trimmed = (string-trim *uri-trim-chars* line)
+        when (and (plusp (length trimmed))
+                  (not (char= (char trimmed 0) #\;)))
+        collect trimmed))
+
+(defun read-uris-from-url (url)
+  "Fetch URL via curl and return trimmed URI lines."
+  (multiple-value-bind (code out err)
+      (run-and-capture (list "curl" "-sS" "-L" url) :timeout 20)
+    (unless (and (zerop code) out)
+      (error "read-uris-from-url: curl failed (exit=~a): ~a"
+             code err))
+    (with-input-from-string (stream out)
+      (read-uris-from-stream stream))))
 
 (defun read-file-as-string (pathname)
   (with-open-file (in pathname :external-format :utf-8)
